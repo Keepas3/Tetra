@@ -3,20 +3,23 @@
 import React, { useState } from 'react';
 import TitleScreen from './TitleScreen';
 import TetrisGame from './TetrisGame';
-import OnlineLobby from './OnlineLobby';
 
-export default function TetrisApp() {
-  const [view, setView] = useState<'TITLE' | 'LOBBY' | 'PLAYING'>('TITLE');
-  const [gameMode, setGameMode] = useState('standard');
+const VALID_INITIAL_MODES = ['standard', 'sprint', 'blitz'];
+
+interface TetrisAppProps {
+  // Set from the nav bar's Play menu (e.g. /?mode=sprint) so a mode can be
+  // jumped into directly from anywhere on the site, not just the title
+  // screen's own buttons.
+  initialMode?: string;
+}
+
+export default function TetrisApp({ initialMode }: TetrisAppProps) {
+  const validInitialMode = initialMode && VALID_INITIAL_MODES.includes(initialMode) ? initialMode : undefined;
+
+  const [view, setView] = useState<'TITLE' | 'PLAYING'>(validInitialMode ? 'PLAYING' : 'TITLE');
+  const [gameMode, setGameMode] = useState(validInitialMode ?? 'standard');
 
   const handlePlay = (mode: string) => {
-    // The title screen's "Versus" button routes here instead of straight to
-    // PLAYING — it needs a room + synchronized start before there's a match
-    // to play.
-    if (mode === 'versus-lobby') {
-      setView('LOBBY');
-      return;
-    }
     setGameMode(mode);
     setView('PLAYING');
   };
@@ -28,13 +31,6 @@ export default function TetrisApp() {
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       {view === 'TITLE' && <TitleScreen onPlay={handlePlay} />}
-
-      {view === 'LOBBY' && (
-        <OnlineLobby
-          onStart={() => { setGameMode('versus'); setView('PLAYING'); }}
-          onCancel={handleMenu}
-        />
-      )}
 
       {/* We pass the gameMode down, and give it a way to return to the menu! */}
       {view === 'PLAYING' && <TetrisGame mode={gameMode} onMenu={handleMenu} />}

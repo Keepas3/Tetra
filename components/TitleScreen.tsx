@@ -2,6 +2,8 @@
 import React, { useEffect, useState } from 'react';
 import { supabase } from '../app/utils/supabaseClient'; // Adjust path if needed
 import { useBackgroundTheme } from './UseBackgroundTheme'; // Adjust path if needed
+import { useColorTheme } from './useColorTheme';
+import { CUSTOM_THEME_ID } from './themePresets';
 
 interface TitleScreenProps {
   onPlay: (mode: string) => void;
@@ -33,6 +35,13 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
     setThemeId: setBackgroundThemeId,
     isLoading: isLoadingThemes,
   } = useBackgroundTheme();
+  const {
+    presetId: colorPresetId,
+    customAccent,
+    presets: colorPresets,
+    setPresetId: setColorPresetId,
+    setCustomAccent,
+  } = useColorTheme();
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const handleSelectTheme = (id: string) => {
@@ -134,7 +143,7 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
           height: '32px',
           background: 'transparent',
           border: 'none',
-          color: isSettingsOpen ? '#e5729f' : 'rgba(255,255,255,0.75)',
+          color: isSettingsOpen ? 'var(--tt-accent)' : 'rgba(255,255,255,0.75)',
           cursor: 'pointer',
           fontSize: '1.35rem',
           lineHeight: 1,
@@ -146,8 +155,8 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
           textShadow: '0 1px 4px rgba(0,0,0,0.8)',
           transition: 'color 0.2s',
         }}
-        onMouseOver={(e) => { e.currentTarget.style.color = '#e5729f'; }}
-        onMouseOut={(e) => { e.currentTarget.style.color = isSettingsOpen ? '#e5729f' : 'rgba(255,255,255,0.75)'; }}
+        onMouseOver={(e) => { e.currentTarget.style.color = 'var(--tt-accent)'; }}
+        onMouseOut={(e) => { e.currentTarget.style.color = isSettingsOpen ? 'var(--tt-accent)' : 'rgba(255,255,255,0.75)'; }}
       >
         ⚙
       </button>
@@ -196,12 +205,12 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
                   display: 'flex',
                   alignItems: 'center',
                   gap: '0.5rem',
-                  backgroundColor: theme.id === backgroundThemeId ? 'rgba(229,114,159,0.15)' : 'transparent',
+                  backgroundColor: theme.id === backgroundThemeId ? 'color-mix(in srgb, var(--tt-accent) 15%, transparent)' : 'transparent',
                   border: 'none',
                   borderRadius: '4px',
                   padding: '0.35rem 0.4rem',
                   cursor: 'pointer',
-                  color: theme.id === backgroundThemeId ? '#e5729f' : 'rgba(255,255,255,0.7)',
+                  color: theme.id === backgroundThemeId ? 'var(--tt-accent)' : 'rgba(255,255,255,0.7)',
                   fontSize: '0.75rem',
                   textAlign: 'left',
                   fontFamily: 'monospace',
@@ -225,11 +234,88 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
                 Loading more…
               </p>
             )}
+
+            <p
+              style={{
+                fontSize: '0.65rem',
+                letterSpacing: '0.15em',
+                textTransform: 'uppercase',
+                color: 'rgba(255,255,255,0.4)',
+                margin: '0.6rem 0 0.25rem 0',
+                paddingTop: '0.5rem',
+                borderTop: '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              Accent
+            </p>
+            {colorPresets.map((preset) => (
+              <button
+                key={preset.id}
+                onClick={() => setColorPresetId(preset.id)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  backgroundColor: preset.id === colorPresetId ? 'color-mix(in srgb, var(--tt-accent) 15%, transparent)' : 'transparent',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '0.35rem 0.4rem',
+                  cursor: 'pointer',
+                  color: preset.id === colorPresetId ? 'var(--tt-accent)' : 'rgba(255,255,255,0.7)',
+                  fontSize: '0.75rem',
+                  textAlign: 'left',
+                  fontFamily: 'monospace',
+                }}
+              >
+                <span
+                  style={{
+                    width: '12px',
+                    height: '12px',
+                    borderRadius: '50%',
+                    backgroundColor: preset.tokens.accent,
+                    border: '1px solid rgba(255,255,255,0.25)',
+                    flexShrink: 0,
+                  }}
+                />
+                {preset.label}
+              </button>
+            ))}
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                backgroundColor: colorPresetId === CUSTOM_THEME_ID ? 'color-mix(in srgb, var(--tt-accent) 15%, transparent)' : 'transparent',
+                borderRadius: '4px',
+                padding: '0.35rem 0.4rem',
+                cursor: 'pointer',
+                color: colorPresetId === CUSTOM_THEME_ID ? 'var(--tt-accent)' : 'rgba(255,255,255,0.7)',
+                fontSize: '0.75rem',
+                fontFamily: 'monospace',
+              }}
+            >
+              <input
+                type="color"
+                value={customAccent}
+                onChange={(e) => setCustomAccent(e.target.value)}
+                style={{
+                  width: '14px',
+                  height: '14px',
+                  padding: 0,
+                  border: '1px solid rgba(255,255,255,0.25)',
+                  borderRadius: '3px',
+                  background: 'none',
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                }}
+              />
+              Custom
+            </label>
           </div>
         </>
       )}
 
-      <h1 style={{ fontSize: '3rem', color: '#e5729f', textShadow: '0 2px 6px rgba(0,0,0,0.85), 0 0 20px rgba(229,114,159,0.8)', margin: '0 0 0.5rem 0', letterSpacing: '0.2em' }}>
+      <h1 style={{ fontSize: '3rem', color: 'var(--tt-accent)', textShadow: '0 2px 6px rgba(0,0,0,0.85), 0 0 20px color-mix(in srgb, var(--tt-accent) 80%, transparent)', margin: '0 0 0.5rem 0', letterSpacing: '0.2em' }}>
         TETRIS
       </h1>
       <p style={{ color: 'rgba(255,255,255,0.85)', textShadow: '0 1px 4px rgba(0,0,0,0.85)', marginBottom: '2rem', letterSpacing: '0.3em', fontSize: '0.875rem' }}>
@@ -243,13 +329,13 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
         <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '0.5rem' }}>
           <button
             onClick={() => setViewMode('sprint')}
-            style={{ flex: 1, backgroundColor: 'transparent', border: 'none', color: viewMode === 'sprint' ? '#e5729f' : 'rgba(255,255,255,0.55)', cursor: 'pointer', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: viewMode === 'sprint' ? 'bold' : 'normal', transition: 'color 0.2s' }}
+            style={{ flex: 1, backgroundColor: 'transparent', border: 'none', color: viewMode === 'sprint' ? 'var(--tt-accent)' : 'rgba(255,255,255,0.55)', cursor: 'pointer', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: viewMode === 'sprint' ? 'bold' : 'normal', transition: 'color 0.2s' }}
           >
             40 Lines
           </button>
-          <button 
+          <button
             onClick={() => setViewMode('blitz')}
-            style={{ flex: 1, backgroundColor: 'transparent', border: 'none', color: viewMode === 'blitz' ? '#e5729f' : 'rgba(255,255,255,0.55)', cursor: 'pointer', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: viewMode === 'blitz' ? 'bold' : 'normal', transition: 'color 0.2s' }}
+            style={{ flex: 1, backgroundColor: 'transparent', border: 'none', color: viewMode === 'blitz' ? 'var(--tt-accent)' : 'rgba(255,255,255,0.55)', cursor: 'pointer', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: viewMode === 'blitz' ? 'bold' : 'normal', transition: 'color 0.2s' }}
           >
             Blitz (3 min)
           </button>
@@ -299,7 +385,7 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
                 <span style={{ fontWeight: i === 0 ? 'bold' : 'normal', letterSpacing: '0.1em' }}>
                   {i + 1}. {entry.name}
                 </span>
-                <span style={{ color: i === 0 ? '#e5729f' : 'inherit', textShadow: i === 0 ? '0 0 8px rgba(229,114,159,0.5)' : 'none' }}>
+                <span style={{ color: i === 0 ? 'var(--tt-accent)' : 'inherit', textShadow: i === 0 ? '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)' : 'none' }}>
                   {viewMode === 'sprint' ? formatTime(entry.score) : entry.score}
                 </span>
               </div>
@@ -310,17 +396,17 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
       
       {/* Play Buttons */}
       <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', justifyContent: 'center' }}>
-        <button 
+        <button
           onClick={() => onPlay('standard')}
-          style={{ 
-            backgroundColor: 'rgba(50,15,28,0.65)', border: '1px solid #e5729f', color: 'white', 
-            padding: '10px 24px', fontSize: '0.875rem', cursor: 'pointer', borderRadius: '8px', 
-            textTransform: 'uppercase', letterSpacing: '0.2em', transition: 'all 0.2s', 
+          style={{
+            backgroundColor: 'color-mix(in srgb, var(--tt-accent) 15%, black)', border: '1px solid var(--tt-accent)', color: 'white',
+            padding: '10px 24px', fontSize: '0.875rem', cursor: 'pointer', borderRadius: '8px',
+            textTransform: 'uppercase', letterSpacing: '0.2em', transition: 'all 0.2s',
             textShadow: '0 1px 3px rgba(0,0,0,0.7)',
-            boxShadow: '0 4px 18px rgba(0,0,0,0.4), 0 0 15px rgba(229,114,159,0.25)' 
+            boxShadow: '0 4px 18px rgba(0,0,0,0.4), 0 0 15px color-mix(in srgb, var(--tt-accent) 25%, transparent)'
           }}
-          onMouseOver={(e) => { e.currentTarget.style.backgroundColor = 'rgba(229,114,159,0.5)'; e.currentTarget.style.boxShadow = '0 4px 18px rgba(0,0,0,0.4), 0 0 25px rgba(229,114,159,0.6)'; }}
-          onMouseOut={(e) => { e.currentTarget.style.backgroundColor = 'rgba(50,15,28,0.65)'; e.currentTarget.style.boxShadow = '0 4px 18px rgba(0,0,0,0.4), 0 0 15px rgba(229,114,159,0.25)'; }}
+          onMouseOver={(e) => { e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--tt-accent) 50%, transparent)'; e.currentTarget.style.boxShadow = '0 4px 18px rgba(0,0,0,0.4), 0 0 25px color-mix(in srgb, var(--tt-accent) 60%, transparent)'; }}
+          onMouseOut={(e) => { e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--tt-accent) 15%, black)'; e.currentTarget.style.boxShadow = '0 4px 18px rgba(0,0,0,0.4), 0 0 15px color-mix(in srgb, var(--tt-accent) 25%, transparent)'; }}
         >
           Zen Mode
         </button>
@@ -355,20 +441,6 @@ export default function TitleScreen({ onPlay }: TitleScreenProps) {
           Blitz (3 min)
         </button>
 
-        <button
-          onClick={() => onPlay('versus-lobby')}
-          style={{
-            backgroundColor: 'rgba(10,10,14,0.55)', border: '1px solid rgba(126,231,135,0.5)', color: '#7ee787',
-            padding: '10px 24px', fontSize: '0.875rem', cursor: 'pointer', borderRadius: '8px',
-            textTransform: 'uppercase', letterSpacing: '0.2em', transition: 'all 0.2s',
-            textShadow: '0 1px 3px rgba(0,0,0,0.7)',
-            boxShadow: '0 4px 18px rgba(0,0,0,0.35)'
-          }}
-          onMouseOver={(e) => { e.currentTarget.style.backgroundColor = 'rgba(126,231,135,0.15)'; }}
-          onMouseOut={(e) => { e.currentTarget.style.backgroundColor = 'rgba(10,10,14,0.55)'; }}
-        >
-          Versus (Beta)
-        </button>
       </div>
 
     </div>

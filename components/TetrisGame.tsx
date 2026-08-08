@@ -5,8 +5,57 @@ import { COLS, ROWS, BLOCK_SIZE, COLORS, PIECES } from './tetrisConstants';
 import { supabase } from '../app/utils/supabaseClient'; 
 
 interface TetrisGameProps {
-  mode: string; 
+  mode: string;
   onMenu: () => void;
+  // Versus-mode-only bridge to the room's Realtime channel (owned by
+  // VersusApp/useOnlineRoom) — TetrisGame stays otherwise unaware of
+  // Supabase, it just sends/receives plain data through these.
+  onAttack?: (amount: number) => void;
+  incomingGarbage?: { amount: number; seq: number } | null;
+  // Win condition is last-player-standing: onEliminated fires once when this
+  // client tops out, eliminatedOpponentIds grows as opponents broadcast their
+  // own eliminations, and opponentCount is the match's starting roster size
+  // (a snapshot, not live presence — see VersusApp) — once
+  // eliminatedOpponentIds covers everyone, this client has outlasted the room.
+  onEliminated?: () => void;
+  eliminatedOpponentIds?: string[];
+  opponentCount?: number;
+  // Full match roster (same snapshot opponentCount is derived from), used to
+  // seed a preview slot for every opponent from the moment the match starts
+  // — opponentBoards below only gets an entry once that opponent's first
+  // piece locks, so without this, previews would pop in one at a time as a
+  // bigger lobby's players each place their first piece instead of all
+  // being visible (empty) immediately.
+  opponentIds?: string[];
+  // Only used by the post-match "Rematch" button — keeps the room alive and
+  // returns to the lobby's ready-up screen, unlike onMenu (full leave).
+  onRematchMenu?: () => void;
+  // Shared 7-bag RNG seed (from useOnlineRoom's matchSeed) so both players
+  // see the identical piece sequence — see the mulberry32/generateBag setup.
+  seed?: number;
+  // Host-chosen room setting (from useOnlineRoom's matchStartingLevel),
+  // defaulting to 1 — everyone in the match starts at this level instead of
+  // always level 1, and the level-up-every-10-lines formula below is offset
+  // from it rather than reset to it.
+  startingLevel?: number;
+  // Host-chosen room setting (from useOnlineRoom's matchLives), defaulting
+  // to 1 — topping out with lives remaining soft-resets the board (like
+  // sandbox's board-clear) instead of ending the match; only running out of
+  // lives is a real elimination. See handleGameOver's versus branch.
+  lives?: number;
+  // Opponent board previews, rendered as small MiniBoard grids — one entry
+  // per opponent, however many that is. Sent once per lock (see lockPiece)
+  // AND periodically during play (see PREVIEW_BROADCAST_INTERVAL_MS in the
+  // game loop), so previews track live movement/gravity, not just spawns.
+  // pieceMatrix/pieceX/pieceY are the opponent's actual current piece shape
+  // and position (already rotated), not just a type to re-derive a spawn
+  // position from. livesRemaining is their current life count (see `lives`).
+  onBoardUpdate?: (board: number[][], pieceMatrix: number[][], pieceX: number, pieceY: number, livesRemaining: number) => void;
+  opponentBoards?: { guestId: string; board: number[][]; pieceMatrix: number[][]; pieceX: number; pieceY: number; livesRemaining: number }[];
+  // Fired once on a win — VersusApp owns the actual session win counter
+  // (displayed in OnlineLobby instead of here, since this component fully
+  // remounts every match and the counter needs to survive that).
+  onMatchWin?: () => void;
 }
 
 interface ScoreEntry {
@@ -19,6 +68,12 @@ interface ScoreEntry {
 const MAX_LEADERBOARD = 8;
 const SPRINT_GOAL = 40;
 const BLITZ_TIME_LIMIT = 3 * 60 * 1000; // 3 minutes in milliseconds
+// Versus-only: how often the game loop broadcasts this client's live board +
+// active piece to opponents (see the `update()` loop and MiniBoard), on top
+// of the existing once-per-lock broadcast. Frequent enough to read as
+// "closely following" their actual play, throttled well below per-frame so
+// it doesn't flood the Realtime channel.
+const PREVIEW_BROADCAST_INTERVAL_MS = 200;
 // Piece type (matches PIECES/COLORS indexing) paired with its rebindable
 // action name — defaults to keys 1-7 in that same order (I, O, T, S, Z, J, L).
 const SPAWN_HOTKEY_ACTIONS = [
@@ -82,17 +137,35 @@ const I_WALL_KICKS: Record<string, {x: number, y: number}[]> = {
 
 const KICKS_180 = [{x:0, y:0}, {x:0, y:-1}, {x:-1, y:0}, {x:1, y:0}, {x:0, y:1}];
 
-const generateBag = () => {
+// Deterministic PRNG (mulberry32) — used only in versus mode, seeded
+// identically on both clients, so both boards see the same piece sequence.
+// Solo modes keep using plain Math.random() via generateBag's default.
+const mulberry32 = (seed: number) => {
+  let s = seed;
+  return () => {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
+const generateBag = (rand: () => number = Math.random) => {
   const bag = [1, 2, 3, 4, 5, 6, 7];
   for (let i = bag.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(rand() * (i + 1));
     [bag[i], bag[j]] = [bag[j], bag[i]];
   }
   return bag;
 };
 
-const createMatrix = (w: number, h: number) => 
+const createMatrix = (w: number, h: number) =>
   Array.from({ length: h }, () => Array(w).fill(0));
+
+// Shared placeholder for an opponent's preview before their board-snapshot
+// broadcast has arrived — MiniBoard only reads it, never mutates it, so one
+// shared instance is safe across every placeholder slot.
+const EMPTY_MINI_BOARD = createMatrix(COLS, ROWS);
 
 const collide = (boardMatrix: number[][], playerPiece: { matrix: number[][], pos: { x: number, y: number } }) => {
   const m = playerPiece.matrix;
@@ -113,6 +186,27 @@ const merge = (boardMatrix: number[][], playerPiece: { matrix: number[][], pos: 
   });
 };
 
+// Versus-mode garbage: attack size per clear (T-Spin Single/Double/Triple,
+// then Single/Double/Triple/Tetris), a combo bonus table on top, and a row
+// insertion helper — all pure so lockPiece can call straight into them.
+const GARBAGE_VALUE = 8;
+const COMBO_ATTACK = [0, 0, 1, 1, 1, 2, 2, 3, 3, 4, 4, 4, 5];
+
+const getBaseAttack = (linesCleared: number, tSpin: boolean): number => {
+  if (tSpin) return linesCleared === 1 ? 2 : linesCleared === 2 ? 4 : linesCleared === 3 ? 6 : 0;
+  return linesCleared === 2 ? 1 : linesCleared === 3 ? 2 : linesCleared === 4 ? 4 : 0;
+};
+
+const insertGarbageRows = (boardMatrix: number[][], count: number) => {
+  const gapCol = Math.floor(Math.random() * COLS);
+  for (let i = 0; i < count; i++) {
+    boardMatrix.shift();
+    const row = new Array(COLS).fill(GARBAGE_VALUE);
+    row[gapCol] = 0;
+    boardMatrix.push(row);
+  }
+};
+
 const rotate = (matrix: number[][], dir: number) => {
   const rotated = matrix.map((_, index) => matrix.map(col => col[index]));
   if (dir > 0) return rotated.map(row => row.reverse());
@@ -130,6 +224,65 @@ const MiniPiece = ({ type }: { type: number | null }) => {
           style={{ width: '12px', height: '12px', borderRadius: '2px', backgroundColor: val ? COLORS[val] : 'transparent', boxShadow: val ? `0 0 8px ${COLORS[val]}` : 'none' }}
         />
       )))}
+    </div>
+  );
+};
+
+// Compact opponent-board preview — same small-DOM-grid approach as MiniPiece
+// above rather than a canvas, since there can be several of these at once (up
+// to MAX_ROOM_SIZE opponents) and they only need to read as a rough shape,
+// not render crisp/animated like the main board. `cellSize` is a literal
+// pixel value (not a multiplier) so callers can solve for an exact overall
+// board size. `gap`/`padding` default to scaling with cellSize (matching the
+// original fixed-3px version's proportions, for the compact side-column
+// case), but the 1v1 adjacent board below overrides both to small fixed
+// values instead — a gap/padding that scales with cellSize adds a bigger
+// fraction of overhead to the (shorter) width than the (taller) height,
+// since COLS and ROWS differ, which skews the rendered aspect ratio away
+// from the main board's own COLS:ROWS proportions the bigger cellSize gets;
+// fixed overhead keeps that skew negligible so "90% of the main board" is
+// accurate in both dimensions, not just the one solved for.
+//
+// `pieceMatrix`/`pieceX`/`pieceY`, when given, overlay the opponent's actual
+// current piece (already rotated, real position) on top of the locked
+// board — this is real data now, not a guess: the game loop broadcasts it
+// on every lock AND periodically during play (see
+// PREVIEW_BROADCAST_INTERVAL_MS), so the preview tracks live movement and
+// gravity instead of freezing at spawn between locks or faking a fall
+// locally. No animation/interpolation here — just render whatever the last
+// broadcast said, the same way `board` itself is rendered.
+//
+// `eliminated` dims the board and stamps "ELIMINATED" over it — covers both
+// topping out and disconnecting, since useOnlineRoom already folds a dropped
+// connection into eliminatedGuestIds (see CLAUDE.md).
+const MiniBoard = ({ board, cellSize = 3, gap = cellSize / 3, padding = cellSize, pieceMatrix, pieceX = 0, pieceY = 0, eliminated }: { board: number[][]; cellSize?: number; gap?: number; padding?: number; pieceMatrix?: number[][]; pieceX?: number; pieceY?: number; eliminated?: boolean }) => {
+  return (
+    <div style={{ position: 'relative' }}>
+      <div style={{ display: 'grid', gap: `${gap}px`, gridTemplateColumns: `repeat(${COLS}, 1fr)`, backgroundColor: 'rgba(0,0,0,0.6)', padding: `${padding}px`, borderRadius: `${padding}px`, border: '1px solid rgba(255,255,255,0.1)', opacity: eliminated ? 0.35 : 1 }}>
+        {board.map((row, y) => row.map((val, x) => {
+          let cellVal = val;
+          if (pieceMatrix) {
+            const px = x - pieceX;
+            const py = y - pieceY;
+            if (py >= 0 && py < pieceMatrix.length && px >= 0 && px < pieceMatrix[0].length && pieceMatrix[py][px]) {
+              cellVal = pieceMatrix[py][px];
+            }
+          }
+          return (
+            <div
+              key={`${x}-${y}`}
+              style={{ width: `${cellSize}px`, height: `${cellSize}px`, backgroundColor: cellVal ? COLORS[cellVal] : 'rgba(255,255,255,0.04)' }}
+            />
+          );
+        }))}
+      </div>
+      {eliminated && (
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: `${Math.max(padding, 4)}px` }}>
+          <span style={{ fontSize: `${Math.max(cellSize * 1.4, 8)}px`, color: '#f87171', fontWeight: 'bold', letterSpacing: '0.08em', textAlign: 'center', textShadow: '0 1px 3px rgba(0,0,0,0.9)', textTransform: 'uppercase', lineHeight: 1.2 }}>
+            Eliminated
+          </span>
+        </div>
+      )}
     </div>
   );
 };
@@ -168,9 +321,9 @@ const TouchControlButton = ({
       fontSize: '1.1rem',
       fontWeight: 'bold',
       borderRadius: '10px',
-      border: '1px solid #e5729f',
-      backgroundColor: 'rgba(229,114,159,0.25)',
-      color: '#e5729f',
+      border: '1px solid var(--tt-accent)',
+      backgroundColor: 'color-mix(in srgb, var(--tt-accent) 25%, transparent)',
+      color: 'var(--tt-accent)',
       touchAction: 'manipulation',
       WebkitUserSelect: 'none',
       userSelect: 'none',
@@ -186,14 +339,14 @@ const TouchControlButton = ({
 // 2. MAIN REACT COMPONENT
 // ==========================================
 
-export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
+export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, onEliminated, eliminatedOpponentIds, opponentCount, opponentIds, onRematchMenu, seed, startingLevel, lives, onBoardUpdate, opponentBoards, onMatchWin }: TetrisGameProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timeDisplayRef = useRef<HTMLParagraphElement>(null);
   const requestRef = useRef<number>(0);
   
   const board = useRef<number[][]>(createMatrix(COLS, ROWS));
   const dropCounter = useRef(0);
-  const dropInterval = useRef(calculateDropInterval(1)); 
+  const dropInterval = useRef(calculateDropInterval(startingLevel ?? 1));
   const lastTime = useRef(0);
   
   const gameStartTimeRef = useRef(0);
@@ -208,13 +361,23 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
 
   const scoreRef = useRef(0); 
   const linesRef = useRef(0);
-  const levelRef = useRef(1);
+  const levelRef = useRef(startingLevel ?? 1);
   const lastMoveRef = useRef<'move' | 'rotate' | 'drop' | null>(null);
   const b2bRef = useRef(false);
   const comboRef = useRef(-1);
   const actionTextRef = useRef({ text: '', timer: 0 });
 
-  const nextPiecesRef = useRef<number[]>([...generateBag(), ...generateBag()]);
+  // Seeded only in versus mode (once the room's matchSeed prop arrives) so
+  // both players' bags are identical; solo modes fall through to Math.random.
+  const rngRef = useRef<() => number>(mode === 'versus' && seed != null ? mulberry32(seed) : Math.random);
+  const nextPiecesRef = useRef<number[]>([...generateBag(rngRef.current), ...generateBag(rngRef.current)]);
+  // Captured once, synchronously, on first render — before playerReset()
+  // (which runs in the mount effect below) ever shifts nextPiecesRef. Since
+  // versus mode's bag is seeded identically for everyone, this is also every
+  // opponent's first piece, not just this client's — used as the preview
+  // placeholder's active piece before an opponent's own first lock actually
+  // broadcasts one (see previewBoards below).
+  const initialPieceTypeRef = useRef<number>(nextPiecesRef.current[0]);
   const holdPieceRef = useRef<number | null>(null);
   const canHoldRef = useRef(true);
 
@@ -243,9 +406,66 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
   // near-instantly) — this sets dropInterval to Infinity so it never ticks.
   const [zeroGravity, setZeroGravity] = useState(false);
   const zeroGravityRef = useRef(false);
-  // Versus-only: which of the two end states a finished match hit, read by
-  // the LEADERBOARD-state overlay below.
-  const [versusOutcome, setVersusOutcome] = useState<'finished' | 'topout'>('finished');
+  // Versus-only: which end state the match hit (topping out, or outlasting
+  // every other opponent), read by the LEADERBOARD-state overlay below.
+  const [versusOutcome, setVersusOutcome] = useState<'won-last-standing' | 'lost-topout'>('lost-topout');
+  // Versus-only extra-life count (host-set via roomSettings.lives, default
+  // 1). Ref is the source of truth read synchronously inside handleGameOver;
+  // livesDisplay just mirrors it into the HUD, same split as
+  // pendingGarbageRef/pendingGarbageDisplay above.
+  const livesRemainingRef = useRef(lives ?? 1);
+  const [livesDisplay, setLivesDisplay] = useState(lives ?? 1);
+  // Garbage queued from incoming broadcasts, netted against this client's own
+  // attack and inserted into the board on the next piece lock (see lockPiece).
+  const pendingGarbageRef = useRef(0);
+  // Mirrors pendingGarbageRef for the garbage-bar UI — the ref stays the
+  // source of truth read inside the game loop, this just triggers a render.
+  const [pendingGarbageDisplay, setPendingGarbageDisplay] = useState(0);
+  // Live running total for the HUD.
+  const [linesSent, setLinesSent] = useState(0);
+  // PPS/APM (Sprint, Blitz, Versus) and attack/min (Versus only) — raw counts
+  // live in refs (read from the mount-only keydown/touch closures, same
+  // reasoning as canAct/toggleZeroGravity below, and needed synchronously to
+  // compute attack/min in the same tick a new attack is sent), the displayed
+  // rate is recomputed into state each time a piece locks or an action fires
+  // rather than ticking every frame.
+  const piecesLockedRef = useRef(0);
+  const actionsRef = useRef(0);
+  const linesSentRef = useRef(0);
+  const [pps, setPps] = useState(0);
+  const [apm, setApm] = useState(0);
+  const [attackPerMin, setAttackPerMin] = useState(0);
+  // Guards against a local game-over and an opponent-result broadcast both
+  // trying to end the match.
+  const matchEndedRef = useRef(false);
+  // Throttles the live-position broadcast added to the game loop below —
+  // see PREVIEW_BROADCAST_INTERVAL_MS.
+  const lastPreviewBroadcastRef = useRef(0);
+
+  // Incoming garbage just accumulates here — it's netted against this
+  // client's own attack and actually inserted into the board on the next
+  // piece lock (see lockPiece), not on arrival.
+  useEffect(() => {
+    if (mode !== 'versus' || !incomingGarbage) return;
+    pendingGarbageRef.current += incomingGarbage.amount;
+    setPendingGarbageDisplay(pendingGarbageRef.current);
+  }, [mode, incomingGarbage]);
+
+  // Last-player-standing: once every opponent in the starting roster has
+  // broadcast their own elimination, this client has outlasted the room —
+  // independent of anything happening locally, hence matchEndedRef to stop
+  // this double-firing against a local handleGameOver call already in flight.
+  useEffect(() => {
+    if (mode !== 'versus' || matchEndedRef.current) return;
+    if (!opponentCount || (eliminatedOpponentIds?.length ?? 0) < opponentCount) return;
+    matchEndedRef.current = true;
+    scoreRef.current = elapsedTimeRef.current;
+    setVersusOutcome('won-last-standing');
+    setGameState('LEADERBOARD');
+    onMatchWin?.();
+    syncUi();
+  }, [mode, eliminatedOpponentIds, opponentCount]);
+
   const [listeningAction, setListeningAction] = useState<string | null>(null);
   const listeningActionRef = useRef<string | null>(null);
   
@@ -438,12 +658,49 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
     }
 
     if (mode === 'versus') {
-      // No cross-client comparison yet (that's Phase 3, once garbage lines
-      // give a real reason to know the opponent's state) — just show this
-      // client's own result and hand control back to the lobby.
+      // Only ever reached via topout now — versus has no line-clear win
+      // path (see the removed SPRINT_GOAL check in lockPiece), so isWin is
+      // always false here; last-player-standing wins are decided separately
+      // by the eliminatedOpponentIds effect above instead.
+      if (matchEndedRef.current) return;
+
+      if (livesRemainingRef.current > 1) {
+        // Still have a life left — soft-reset like sandbox's board-clear
+        // above, not a real elimination: the match clock, piece queue,
+        // lines-sent/received totals, and win-condition eligibility all
+        // keep running uninterrupted, only the board and combo/back-to-back
+        // state clear.
+        livesRemainingRef.current -= 1;
+        setLivesDisplay(livesRemainingRef.current);
+        board.current = createMatrix(COLS, ROWS);
+        comboRef.current = -1;
+        b2bRef.current = false;
+        dropCounter.current = 0;
+        actionTextRef.current = {
+          text: `TOP OUT\n${livesRemainingRef.current} ${livesRemainingRef.current === 1 ? 'LIFE' : 'LIVES'} LEFT`,
+          timer: 1800,
+        };
+        // Broadcast immediately (same peek-before-reset convention as the
+        // normal lockPiece call site) rather than waiting for the next real
+        // lock — otherwise an opponent's preview would keep showing the
+        // stale, topped-out-looking board and old life count for however
+        // long it takes this player to place their next piece. Same spawn
+        // math as playerReset() itself, computed here since it hasn't run yet.
+        {
+          const nextMatrix = PIECES[nextPiecesRef.current[0]];
+          const nextX = Math.floor(COLS / 2) - Math.floor(nextMatrix[0].length / 2);
+          onBoardUpdate?.(board.current, nextMatrix, nextX, 0, livesRemainingRef.current);
+        }
+        playerReset();
+        syncUi();
+        return;
+      }
+
+      matchEndedRef.current = true;
       scoreRef.current = elapsedTimeRef.current;
-      setVersusOutcome(isWin ? 'finished' : 'topout');
+      setVersusOutcome('lost-topout');
       setGameState('LEADERBOARD');
+      onEliminated?.();
       syncUi();
       return;
     }
@@ -472,7 +729,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
 
   const playerReset = () => {
     player.current.type = nextPiecesRef.current.shift()!;
-    if (nextPiecesRef.current.length <= 5) nextPiecesRef.current.push(...generateBag());
+    if (nextPiecesRef.current.length <= 5) nextPiecesRef.current.push(...generateBag(rngRef.current));
     
     player.current.matrix = PIECES[player.current.type];
     player.current.pos.y = 0;
@@ -501,7 +758,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
     dropInterval.current = calculateDropInterval(1);
     
     comboRef.current = -1; b2bRef.current = false; actionTextRef.current = {text: '', timer: 0};
-    nextPiecesRef.current = [...generateBag(), ...generateBag()];
+    nextPiecesRef.current = [...generateBag(rngRef.current), ...generateBag(rngRef.current)];
     
     player.current.type = nextPiecesRef.current.shift()!;
     player.current.matrix = PIECES[player.current.type];
@@ -514,7 +771,11 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
 
     gameStartTimeRef.current = 0;
     elapsedTimeRef.current = 0;
-    
+    piecesLockedRef.current = 0;
+    actionsRef.current = 0;
+    setPps(0);
+    setApm(0);
+
     if (timeDisplayRef.current) {
         if (mode === 'blitz') timeDisplayRef.current.innerText = '03:00.000';
         else if (mode === 'sprint') timeDisplayRef.current.innerText = '00:00.000';
@@ -526,7 +787,8 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
   };
 
   const lockPiece = () => {
-    merge(board.current, player.current); 
+    countPiece();
+    merge(board.current, player.current);
     const tSpin = isTSpin();
     
     let linesCleared = 0;
@@ -538,6 +800,8 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
       board.current.unshift(row);
       ++y; linesCleared++;
     }
+
+    let attack = mode === 'versus' ? getBaseAttack(linesCleared, tSpin) : 0;
 
     if (linesCleared > 0) {
       comboRef.current++;
@@ -563,6 +827,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         if (b2bRef.current) {
           calculatedScore = Math.floor(calculatedScore * 1.5);
           actionStr = 'B2B ' + actionStr;
+          if (mode === 'versus') attack += 1;
         }
         b2bRef.current = true;
       } else {
@@ -572,6 +837,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
       if (comboRef.current > 0) {
         calculatedScore += 50 * comboRef.current * levelRef.current;
         actionStr += `\n${comboRef.current} Combo`;
+        if (mode === 'versus') attack += COMBO_ATTACK[Math.min(comboRef.current, COMBO_ATTACK.length - 1)];
       }
 
       if (mode === 'blitz' || mode === 'standard') {
@@ -581,14 +847,18 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
       linesRef.current += linesCleared;
       // Sandbox mode's gravity is whatever the player dialed in via the
       // settings panel — it shouldn't creep up on its own from lines cleared.
+      // Offset from startingLevel (1 outside versus, or when the host left it
+      // at the default) rather than reset to a flat +1, so a host-chosen
+      // starting level keeps climbing from there instead of being clobbered
+      // by the first line clear.
       if (mode !== 'standard') {
-        levelRef.current = Math.floor(linesRef.current / 10) + 1;
+        levelRef.current = (startingLevel ?? 1) + Math.floor(linesRef.current / 10);
         dropInterval.current = calculateDropInterval(levelRef.current);
       }
 
       if (actionStr) actionTextRef.current = { text: actionStr, timer: 2000 };
 
-      if ((mode === 'sprint' || mode === 'versus') && linesRef.current >= SPRINT_GOAL) {
+      if (mode === 'sprint' && linesRef.current >= SPRINT_GOAL) {
          handleGameOver(true);
          return;
       }
@@ -601,7 +871,35 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
       }
     }
 
-    playerReset(); 
+    if (mode === 'versus') {
+      const cancelled = Math.min(attack, pendingGarbageRef.current);
+      pendingGarbageRef.current -= cancelled;
+      const netAttack = attack - cancelled;
+      if (netAttack > 0) {
+        onAttack?.(netAttack);
+        linesSentRef.current += netAttack;
+        setLinesSent(linesSentRef.current);
+        const min = elapsedTimeRef.current / 60000;
+        setAttackPerMin(min > 0 ? linesSentRef.current / min : 0);
+      }
+      if (pendingGarbageRef.current > 0) {
+        insertGarbageRows(board.current, pendingGarbageRef.current);
+        pendingGarbageRef.current = 0;
+      }
+      setPendingGarbageDisplay(pendingGarbageRef.current);
+      // nextPiecesRef[0] here (not player.current.type) — playerReset() below
+      // hasn't shifted the queue yet at this point, so this is exactly the
+      // piece about to spawn as the new active piece, without needing to
+      // reorder around playerReset()'s own game-over collision check. Same
+      // spawn math as playerReset() itself, computed here since it hasn't run yet.
+      {
+        const nextMatrix = PIECES[nextPiecesRef.current[0]];
+        const nextX = Math.floor(COLS / 2) - Math.floor(nextMatrix[0].length / 2);
+        onBoardUpdate?.(board.current, nextMatrix, nextX, 0, livesRemainingRef.current);
+      }
+    }
+
+    playerReset();
     dropCounter.current = 0;
   };
 
@@ -818,6 +1116,24 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
   // buttons can't act while paused, in a menu, or before countdown ends.
   const canAct = () => gameStateRef.current === 'PLAYING' && !isPausedRef.current && !showControlsRef.current;
 
+  // PPS/APM tracking — called from lockPiece (one piece placed) and from
+  // every keyboard/touch action below (one deliberate input). Sandbox is
+  // excluded: it's a goalless practice mode, these rate stats don't mean
+  // much there. Recomputed at event time rather than every frame, matching
+  // why TIME itself is a direct DOM write instead of React state.
+  const countPiece = () => {
+    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus') return;
+    piecesLockedRef.current += 1;
+    const sec = elapsedTimeRef.current / 1000;
+    setPps(sec > 0 ? piecesLockedRef.current / sec : 0);
+  };
+  const countAction = () => {
+    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus') return;
+    actionsRef.current += 1;
+    const min = elapsedTimeRef.current / 60000;
+    setApm(min > 0 ? actionsRef.current / min : 0);
+  };
+
   // Touch equivalents of the keyboard handlers below — they drive the same
   // keysDown/dasTimers refs the DAS/ARR loop in update() already reads, so
   // holding a move button repeats exactly like holding the arrow key does.
@@ -828,6 +1144,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
     dasTimers.current.arr = 0;
     dasTimers.current.dcd = 0;
     playerMove(dir);
+    countAction();
   };
   const touchMoveEnd = (dir: -1 | 1) => {
     if (dir === -1) keysDown.current.left = false; else keysDown.current.right = false;
@@ -835,6 +1152,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
   const touchSoftDropStart = () => {
     if (!canAct()) return;
     keysDown.current.down = true;
+    countAction();
   };
   const touchSoftDropEnd = () => {
     keysDown.current.down = false;
@@ -842,14 +1160,17 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
   const touchRotate = (dir: number) => {
     if (!canAct()) return;
     playerRotate(dir);
+    countAction();
   };
   const touchHardDrop = () => {
     if (!canAct()) return;
     hardDrop();
+    countAction();
   };
   const touchHold = () => {
     if (!canAct()) return;
     holdPiece();
+    countAction();
   };
 
   const drawMatrix = (ctx: CanvasRenderingContext2D, matrix: number[][], offset: { x: number, y: number }, isGhost = false) => {
@@ -1015,6 +1336,17 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         }
       }
       } // end playingFrame
+
+      // Live opponent-preview broadcast — the piece's actual current matrix
+      // (already rotated) and position, not just its type/spawn point, so
+      // MiniBoard can render exactly what's happening rather than guessing.
+      // Throttled rather than tied to any specific action, so it also covers
+      // plain gravity between inputs, which the once-per-lock broadcast
+      // alone never captured.
+      if (mode === 'versus' && time - lastPreviewBroadcastRef.current > PREVIEW_BROADCAST_INTERVAL_MS) {
+        lastPreviewBroadcastRef.current = time;
+        onBoardUpdate?.(board.current, player.current.matrix, player.current.pos.x, player.current.pos.y, livesRemainingRef.current);
+      }
     }
 
     const canvas = canvasRef.current;
@@ -1064,27 +1396,30 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         keysDown.current.left = true;
         dasTimers.current.das = 0;
         dasTimers.current.arr = 0;
-        dasTimers.current.dcd = 0; 
-        playerMove(-1); 
-      } 
+        dasTimers.current.dcd = 0;
+        playerMove(-1);
+        countAction();
+      }
       else if (e.key === c['Right']) {
         keysDown.current.right = true;
         dasTimers.current.das = 0;
         dasTimers.current.arr = 0;
-        dasTimers.current.dcd = 0; 
-        playerMove(1); 
+        dasTimers.current.dcd = 0;
+        playerMove(1);
+        countAction();
       }
-      else if (e.key === c['Down']) keysDown.current.down = true;
-      else if (e.key === c['Rotate CW']) playerRotate(1);
-      else if (e.key === c['Rotate CCW']) playerRotate(-1);
-      else if (e.key === c['Rotate 180']) playerRotate(2);
+      else if (e.key === c['Down']) { keysDown.current.down = true; countAction(); }
+      else if (e.key === c['Rotate CW']) { playerRotate(1); countAction(); }
+      else if (e.key === c['Rotate CCW']) { playerRotate(-1); countAction(); }
+      else if (e.key === c['Rotate 180']) { playerRotate(2); countAction(); }
       else if (e.key === c['Hard Drop']) {
         if (!keysDown.current.hardDrop) {
             keysDown.current.hardDrop = true;
             hardDrop();
+            countAction();
         }
       }
-      else if (e.key === c['Hold']) holdPiece();
+      else if (e.key === c['Hold']) { holdPiece(); countAction(); }
       else if (mode === 'standard' && e.key === c['Clear Board']) clearSandboxBoard();
       else if (mode === 'standard' && e.key === c['Toggle 0-G']) toggleZeroGravity();
       else if (mode === 'standard') {
@@ -1110,10 +1445,49 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
       window.removeEventListener('keyup', handleKeyUp);
       if (requestRef.current) cancelAnimationFrame(requestRef.current); 
     };
-  }, []); 
+  }, []);
+
+  // Every opponent in the match roster gets a preview slot from the moment
+  // the match starts, not just the ones who've locked a piece yet — without
+  // this, a bigger lobby's previews would pop in one at a time as each
+  // opponent places their first piece instead of all showing up (empty)
+  // immediately. Falls back to opponentBoards' own guestIds if opponentIds
+  // wasn't passed, matching the old behavior.
+  // Placeholder piece for an opponent whose own first broadcast hasn't
+  // arrived yet — versus's bag is seeded identically for everyone (see
+  // initialPieceTypeRef above), so this is provably their real first piece,
+  // at the same spawn position playerReset() itself would use.
+  const initialPieceMatrix = PIECES[initialPieceTypeRef.current];
+  const initialPieceX = Math.floor(COLS / 2) - Math.floor(initialPieceMatrix[0].length / 2);
+  const previewBoards = (opponentIds ?? opponentBoards?.map((b) => b.guestId) ?? []).map((guestId) => {
+    const real = opponentBoards?.find((b) => b.guestId === guestId);
+    const eliminated = eliminatedOpponentIds?.includes(guestId) ?? false;
+    return real
+      ? { ...real, eliminated }
+      : { guestId, board: EMPTY_MINI_BOARD, pieceMatrix: initialPieceMatrix, pieceX: initialPieceX, pieceY: 0, eliminated, livesRemaining: lives ?? 1 };
+  });
+
+  // A genuine 1v1 (exactly one opponent) on a desktop-sized viewport gets its
+  // own large board rendered directly beside the player's, rather than the
+  // small side-column preview used for a fuller room — there's no rest of
+  // the room competing for space, and it's the one board actually worth
+  // reading at a glance. Mobile keeps the compact column regardless (no
+  // static pixel width for the main board there — it's a CSS min() against
+  // viewport width — so there's nothing reliable to size 90% of).
+  const isDesktopOneVOne = mode === 'versus' && !isMobile && previewBoards.length === 1;
+  // Main board is a fixed COLS*BLOCK_SIZE (300px) canvas on desktop; 90% of
+  // that. Fixed (not cellSize-proportional) gap/padding here — see MiniBoard
+  // above for why — so solving total-width = COLS*cellSize + (COLS-1)*gap +
+  // 2*padding for cellSize lands the *whole board*, not just its cells, at
+  // that 90% target, and the height comes out at essentially the same 90%
+  // too rather than visibly short.
+  const ONE_V_ONE_GAP = 1;
+  const ONE_V_ONE_PADDING = 4;
+  const oneVOneBoardWidth = COLS * BLOCK_SIZE * 0.9;
+  const oneVOneCellSize = (oneVOneBoardWidth - 2 * ONE_V_ONE_PADDING - (COLS - 1) * ONE_V_ONE_GAP) / COLS;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: isMobile ? '0.6rem' : 0, width: '100%', maxWidth: isMobile ? '100%' : '48rem', fontFamily: 'monospace', userSelect: 'none' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: isMobile ? '0.6rem' : 0, width: '100%', maxWidth: isMobile ? '100%' : (isDesktopOneVOne ? '68rem' : '48rem'), fontFamily: 'monospace', userSelect: 'none' }}>
     <div style={{ display: 'flex', flexDirection: 'row', gap: isMobile ? '0.5rem' : '3rem', alignItems: 'flex-start', justifyContent: 'center', width: '100%' }}>
 
       {/* Left Panel */}
@@ -1130,14 +1504,14 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: isMobile ? '0.6rem' : '1.5rem' }}>
               <button
                 onClick={() => openPanel('controls')}
-                style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'rgba(50,15,28,0.65)', color: 'rgba(255,255,255,0.7)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}
+                style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'color-mix(in srgb, var(--tt-accent) 15%, black)', color: 'rgba(255,255,255,0.7)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}
               >
                 {showControls && settingsTab === 'controls' ? 'Resume' : 'Settings'}
               </button>
               {mode === 'standard' && (
                 <button
                   onClick={() => openPanel('sandbox')}
-                  style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'rgba(50,15,28,0.65)', color: '#e5729f', border: '1px solid rgba(229,114,159,0.3)', borderRadius: '4px', cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}
+                  style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'color-mix(in srgb, var(--tt-accent) 15%, black)', color: 'var(--tt-accent)', border: '1px solid color-mix(in srgb, var(--tt-accent) 30%, transparent)', borderRadius: '4px', cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}
                 >
                   {showControls && settingsTab === 'sandbox' ? 'Resume' : 'Sandbox'}
                 </button>
@@ -1146,14 +1520,49 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
           )}
         </div>
 
-        <button onClick={onMenu} style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'rgba(50,15,28,0.65)',
-          color: '#e5729f', border: '1px solid rgba(229,114,159,0.3)', borderRadius: '4px',
+        <button onClick={onMenu} style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'color-mix(in srgb, var(--tt-accent) 15%, black)',
+          color: 'var(--tt-accent)', border: '1px solid color-mix(in srgb, var(--tt-accent) 30%, transparent)', borderRadius: '4px',
           cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
           Quit
         </button>
       </div>
 
-      {/* Center Panel */}
+      {/* Garbage Bar — versus-only, one segment per board row (ROWS total),
+          filled from the bottom to show how many garbage lines are queued
+          and about to land on this client's next piece lock. */}
+      {mode === 'versus' && (
+        <div style={{ alignSelf: 'stretch', width: isMobile ? '0.4rem' : '0.7rem', flexShrink: 0 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', height: '100%' }}>
+            {Array.from({ length: ROWS }).map((_, i) => {
+              const filled = i >= ROWS - pendingGarbageDisplay;
+              return (
+                <div
+                  key={i}
+                  style={{
+                    flex: 1,
+                    borderRadius: '1px',
+                    backgroundColor: filled ? '#f87171' : 'rgba(255,255,255,0.06)',
+                    boxShadow: filled ? '0 0 6px rgba(248,113,113,0.8)' : 'none',
+                    transition: 'background-color 0.15s ease',
+                  }}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Center Panel — wrapped in a column so an optional "Lives" tag can
+          sit above the board itself, same small-label language as
+          HOLD/NEXT/OPPONENT elsewhere, only shown once the host actually
+          turns lives on (see the HUD's own gating for why the default stays
+          untouched). */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.4rem', flexShrink: 0 }}>
+        {mode === 'versus' && (lives ?? 1) > 1 && (
+          <p style={{ fontSize: isMobile ? '0.6rem' : '0.75rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: isMobile ? '1px 6px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px', textTransform: 'uppercase' }}>
+            Lives: {livesDisplay} / {lives}
+          </p>
+        )}
       <div style={{ position: 'relative', border: '2px solid rgba(255,255,255,0.1)', backgroundColor: 'black', borderRadius: '0.5rem', boxShadow: '0 0 30px rgba(0,0,0,0.5)', overflow: 'hidden', flexShrink: 0 }}>
         <canvas ref={canvasRef} width={300} height={600} style={isMobile ? { display: 'block', width: 'min(190px, calc(100vw - 224px))', height: 'auto' } : { display: 'block' }} />
         <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'none', backgroundImage: 'linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px)', backgroundSize: '100% 4px' }} />
@@ -1161,7 +1570,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         {/* COUNTDOWN OVERLAY */}
         {gameState === 'COUNTDOWN' && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10 }}>
-            <h2 style={{ color: '#e5729f', fontSize: '5rem', fontWeight: 'bold', textShadow: '0 0 20px rgba(229,114,159,0.8)', margin: 0, letterSpacing: '0.1em', animation: 'pop 0.3s ease-out' }}>
+            <h2 style={{ color: 'var(--tt-accent)', fontSize: '5rem', fontWeight: 'bold', textShadow: '0 0 20px color-mix(in srgb, var(--tt-accent) 80%, transparent)', margin: 0, letterSpacing: '0.1em', animation: 'pop 0.3s ease-out' }}>
               {countdownText}
             </h2>
           </div>
@@ -1170,7 +1579,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         {/* HIGH SCORE ENTRY OVERLAY */}
         {gameState === 'NAME_ENTRY' && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 30, padding: '2rem', overflowY: 'auto' }}>
-             <h3 style={{ color: '#e5729f', letterSpacing: '0.1em', marginBottom: '1rem', marginTop: 0, fontSize: '1.25rem', textAlign: 'center' }}>
+             <h3 style={{ color: 'var(--tt-accent)', letterSpacing: '0.1em', marginBottom: '1rem', marginTop: 0, fontSize: '1.25rem', textAlign: 'center' }}>
                {mode === 'sprint' ? 'NEW BEST TIME!' : 'NEW HIGH SCORE!'}
              </h3>
              <p style={{ color: 'white', marginBottom: '2rem', fontSize: '2rem', fontWeight: 'bold', textShadow: '0 0 10px rgba(255,255,255,0.5)', margin: '0 0 2rem 0' }}>
@@ -1184,29 +1593,32 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                value={nameInput}
                onChange={(e) => setNameInput(e.target.value.toUpperCase().replace(/[^A-Z]/g, ''))}
                onKeyDown={(e) => { if (e.key === 'Enter') saveHighScore(); }}
-               style={{ backgroundColor: 'transparent', border: 'none', borderBottom: '2px solid #e5729f', color: 'white', fontSize: '2.5rem', width: '6rem', textAlign: 'center', textTransform: 'uppercase', outline: 'none', fontFamily: 'monospace', letterSpacing: '0.2em', padding: '0 0 0.5rem 0' }}
+               style={{ backgroundColor: 'transparent', border: 'none', borderBottom: '2px solid var(--tt-accent)', color: 'white', fontSize: '2.5rem', width: '6rem', textAlign: 'center', textTransform: 'uppercase', outline: 'none', fontFamily: 'monospace', letterSpacing: '0.2em', padding: '0 0 0.5rem 0' }}
              />
-             <button disabled={isSubmitting} onClick={saveHighScore} style={{ marginTop: '2.5rem', backgroundColor: '#e5729f', color: 'white', border: 'none', borderRadius: '4px', padding: '10px 32px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '14px', letterSpacing: '0.1em', fontWeight: 'bold', opacity: isSubmitting ? 0.5 : 1 }}>
+             <button disabled={isSubmitting} onClick={saveHighScore} style={{ marginTop: '2.5rem', backgroundColor: 'var(--tt-accent)', color: 'white', border: 'none', borderRadius: '4px', padding: '10px 32px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '14px', letterSpacing: '0.1em', fontWeight: 'bold', opacity: isSubmitting ? 0.5 : 1 }}>
                {isSubmitting ? 'Saving...' : 'Save'}
              </button>
           </div>
         )}
 
-        {/* VERSUS RESULT OVERLAY — no leaderboard/rematch yet, just this
-            client's own outcome (see the versus branch in handleGameOver) */}
+        {/* VERSUS RESULT OVERLAY — Rematch returns to the lobby without
+            leaving the room (see onRematchMenu, wired in VersusApp). Reflects
+            either this client's own topout or outlasting every opponent (see
+            handleGameOver's versus branch and the last-standing effect above). */}
         {gameState === 'LEADERBOARD' && mode === 'versus' && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 30, padding: '2rem 1.5rem', overflowY: 'auto' }}>
-            <h3 style={{ color: '#e5729f', letterSpacing: '0.15em', marginBottom: '1rem', marginTop: 0, fontSize: '1.1rem', textAlign: 'center' }}>
-              {versusOutcome === 'finished' ? 'YOU FINISHED!' : 'TOPPED OUT'}
+            <h3 style={{ color: 'var(--tt-accent)', letterSpacing: '0.15em', marginBottom: '1rem', marginTop: 0, fontSize: '1.1rem', textAlign: 'center' }}>
+              {versusOutcome === 'won-last-standing' && 'YOU WIN — LAST ONE STANDING'}
+              {versusOutcome === 'lost-topout' && 'TOPPED OUT'}
             </h3>
             <p style={{ color: 'white', fontSize: '2rem', fontWeight: 'bold', textShadow: '0 0 10px rgba(255,255,255,0.5)', margin: '0 0 2rem 0' }}>
               {formatTime(uiState.score)}
             </p>
             <button
-              onClick={onMenu}
-              style={{ backgroundColor: '#e5729f', color: 'white', border: 'none', borderRadius: '4px', padding: '10px 32px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '14px', letterSpacing: '0.1em', fontWeight: 'bold' }}
+              onClick={onRematchMenu}
+              style={{ backgroundColor: 'var(--tt-accent)', color: 'white', border: 'none', borderRadius: '4px', padding: '10px 32px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '14px', letterSpacing: '0.1em', fontWeight: 'bold' }}
             >
-              Back to Lobby
+              Rematch
             </button>
           </div>
         )}
@@ -1221,12 +1633,12 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                 <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '12px', textAlign: 'center', marginTop: '2rem' }}>NO SCORES YET</p>
               )}
               {leaderboard.map((entry, i) => (
-                 <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem', backgroundColor: i === 0 ? 'rgba(229,114,159,0.1)' : 'transparent', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                 <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem', backgroundColor: i === 0 ? 'color-mix(in srgb, var(--tt-accent) 10%, transparent)' : 'transparent', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
                     <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                      <span style={{ color: i === 0 ? '#e5729f' : 'rgba(255,255,255,0.5)', fontSize: '12px', width: '1.5rem' }}>#{i + 1}</span>
+                      <span style={{ color: i === 0 ? 'var(--tt-accent)' : 'rgba(255,255,255,0.5)', fontSize: '12px', width: '1.5rem' }}>#{i + 1}</span>
                       <span style={{ color: i === 0 ? 'white' : 'rgba(255,255,255,0.8)', fontSize: '14px', fontWeight: 'bold', letterSpacing: '0.1em' }}>{entry.name}</span>
                     </div>
-                    <span style={{ color: i === 0 ? '#e5729f' : 'white', fontSize: '14px', fontFamily: 'monospace', textShadow: i === 0 ? '0 0 8px rgba(229,114,159,0.5)' : 'none' }}>
+                    <span style={{ color: i === 0 ? 'var(--tt-accent)' : 'white', fontSize: '14px', fontFamily: 'monospace', textShadow: i === 0 ? '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)' : 'none' }}>
                       {mode === 'sprint' ? formatTime(entry.score) : entry.score}
                     </span>
                  </div>
@@ -1234,7 +1646,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', width: '100%', marginTop: '1rem' }}>
-               <button onClick={restartGame} style={{ backgroundColor: '#e5729f', color: 'white', border: 'none', borderRadius: '4px', padding: '12px', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+               <button onClick={restartGame} style={{ backgroundColor: 'var(--tt-accent)', color: 'white', border: 'none', borderRadius: '4px', padding: '12px', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
                  Play Again
                </button>
                <button onClick={onMenu} style={{ backgroundColor: 'transparent', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.7)', borderRadius: '4px', padding: '10px', cursor: 'pointer', fontSize: '12px', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
@@ -1261,7 +1673,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
 
             {settingsTab === 'controls' && (
               <>
-                <p style={{ color: '#e5729f', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 0.75rem 0', alignSelf: 'flex-start' }}>Keybinds</p>
+                <p style={{ color: 'var(--tt-accent)', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.1em', margin: '0 0 0.75rem 0', alignSelf: 'flex-start' }}>Keybinds</p>
                 <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '12px', marginBottom: '1.5rem' }}>
                   {Object.entries(controls)
                     .filter(([action]) => action !== 'null' && !(SANDBOX_HOTKEY_ACTIONS as readonly string[]).includes(action))
@@ -1275,7 +1687,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                           setListeningAction(action);
                           listeningActionRef.current = action;
                         }}
-                        style={{ backgroundColor: listeningAction === action ? '#e5729f' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '6px', fontSize: '10px', cursor: 'pointer', width: '100%', maxWidth: '90px', textAlign: 'center', height: '26px' }}
+                        style={{ backgroundColor: listeningAction === action ? 'var(--tt-accent)' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '6px', fontSize: '10px', cursor: 'pointer', width: '100%', maxWidth: '90px', textAlign: 'center', height: '26px' }}
                       >
                         {listeningAction === action ? '...' : (keyName === ' ' ? 'Space' : keyName.replace('Arrow', ''))}
                       </button>
@@ -1284,14 +1696,14 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                 </div>
 
                 <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '1rem' }}>
-                  <p style={{ color: '#e5729f', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.1em', margin: 0 }}>Handling</p>
+                  <p style={{ color: 'var(--tt-accent)', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.1em', margin: 0 }}>Handling</p>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '10px' }}>DAS (Delay)</span>
                       <span style={{ color: 'white', fontSize: '10px' }}>{tuning.das}ms</span>
                     </div>
-                    <input type="range" min="50" max="300" step="10" value={tuning.das} onChange={(e) => setTuning(p => ({...p, das: Number(e.target.value)}))} style={{ width: '100%', accentColor: '#e5729f', height: '4px' }} />
+                    <input type="range" min="50" max="300" step="10" value={tuning.das} onChange={(e) => setTuning(p => ({...p, das: Number(e.target.value)}))} style={{ width: '100%', accentColor: 'var(--tt-accent)', height: '4px' }} />
                   </div>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -1299,7 +1711,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                       <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '10px' }}>ARR (Speed)</span>
                       <span style={{ color: 'white', fontSize: '10px' }}>{tuning.arr}ms</span>
                     </div>
-                    <input type="range" min="0" max="100" step="1" value={tuning.arr} onChange={(e) => setTuning(p => ({...p, arr: Number(e.target.value)}))} style={{ width: '100%', accentColor: '#e5729f', height: '4px' }} />
+                    <input type="range" min="0" max="100" step="1" value={tuning.arr} onChange={(e) => setTuning(p => ({...p, arr: Number(e.target.value)}))} style={{ width: '100%', accentColor: 'var(--tt-accent)', height: '4px' }} />
                   </div>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -1307,7 +1719,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                       <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '10px' }}>DCD (DAS Cut)</span>
                       <span style={{ color: 'white', fontSize: '10px' }}>{tuning.dcd}ms</span>
                     </div>
-                    <input type="range" min="0" max="100" step="1" value={tuning.dcd} onChange={(e) => setTuning(p => ({...p, dcd: Number(e.target.value)}))} style={{ width: '100%', accentColor: '#e5729f', height: '4px' }} />
+                    <input type="range" min="0" max="100" step="1" value={tuning.dcd} onChange={(e) => setTuning(p => ({...p, dcd: Number(e.target.value)}))} style={{ width: '100%', accentColor: 'var(--tt-accent)', height: '4px' }} />
                   </div>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -1315,7 +1727,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                       <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '10px' }}>SDF (Soft Drop)</span>
                       <span style={{ color: 'white', fontSize: '10px' }}>{tuning.sdf >= 41 ? 'MAX' : `${tuning.sdf}x`}</span>
                     </div>
-                    <input type="range" min="2" max="41" step="1" value={tuning.sdf} onChange={(e) => setTuning(p => ({...p, sdf: Number(e.target.value)}))} style={{ width: '100%', accentColor: '#e5729f', height: '4px' }} />
+                    <input type="range" min="2" max="41" step="1" value={tuning.sdf} onChange={(e) => setTuning(p => ({...p, sdf: Number(e.target.value)}))} style={{ width: '100%', accentColor: 'var(--tt-accent)', height: '4px' }} />
                   </div>
                 </div>
               </>
@@ -1338,16 +1750,16 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                       dropInterval.current = calculateDropInterval(level);
                       syncUi();
                     }}
-                    style={{ width: '100%', accentColor: '#e5729f', height: '4px' }}
+                    style={{ width: '100%', accentColor: 'var(--tt-accent)', height: '4px' }}
                   />
                 </div>
 
                 <button
                   onClick={toggleZeroGravity}
                   style={{
-                    backgroundColor: zeroGravity ? 'rgba(229,114,159,0.25)' : 'rgba(255,255,255,0.1)',
-                    color: zeroGravity ? '#e5729f' : 'white',
-                    border: zeroGravity ? '1px solid #e5729f' : '1px solid rgba(255,255,255,0.15)',
+                    backgroundColor: zeroGravity ? 'color-mix(in srgb, var(--tt-accent) 25%, transparent)' : 'rgba(255,255,255,0.1)',
+                    color: zeroGravity ? 'var(--tt-accent)' : 'white',
+                    border: zeroGravity ? '1px solid var(--tt-accent)' : '1px solid rgba(255,255,255,0.15)',
                     borderRadius: '4px', padding: '8px', cursor: 'pointer', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.1em',
                   }}
                 >
@@ -1383,7 +1795,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                             setListeningAction(action);
                             listeningActionRef.current = action;
                           }}
-                          style={{ backgroundColor: listeningAction === action ? '#e5729f' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '4px', fontSize: '10px', cursor: 'pointer', width: '100%', textAlign: 'center', height: '22px' }}
+                          style={{ backgroundColor: listeningAction === action ? 'var(--tt-accent)' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '4px', fontSize: '10px', cursor: 'pointer', width: '100%', textAlign: 'center', height: '22px' }}
                         >
                           {listeningAction === action ? '...' : (controls[action] === ' ' ? 'Space' : controls[action].replace('Arrow', ''))}
                         </button>
@@ -1405,7 +1817,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                             setListeningAction(action);
                             listeningActionRef.current = action;
                           }}
-                          style={{ backgroundColor: listeningAction === action ? '#e5729f' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '6px', fontSize: '10px', cursor: 'pointer', width: '100%', maxWidth: '90px', textAlign: 'center', height: '26px' }}
+                          style={{ backgroundColor: listeningAction === action ? 'var(--tt-accent)' : 'rgba(255,255,255,0.1)', color: 'white', border: 'none', borderRadius: '4px', padding: '6px', fontSize: '10px', cursor: 'pointer', width: '100%', maxWidth: '90px', textAlign: 'center', height: '26px' }}
                         >
                           {listeningAction === action ? '...' : (controls[action] === ' ' ? 'Space' : controls[action].replace('Arrow', ''))}
                         </button>
@@ -1423,12 +1835,13 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                 isPausedRef.current = false;
                 setIsPaused(false);
               }}
-              style={{ marginTop: '1.5rem', backgroundColor: '#e5729f', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 24px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '12px', letterSpacing: '0.1em' }}
+              style={{ marginTop: '1.5rem', backgroundColor: 'var(--tt-accent)', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 24px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '12px', letterSpacing: '0.1em' }}
             >
               Done
             </button>
           </div>
         )}
+      </div>
       </div>
 
       {/* Right Panel */}
@@ -1446,11 +1859,11 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.5rem' : '1rem', backgroundColor: 'rgba(0,0,0,0.75)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '0.375rem', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.6)', padding: isMobile ? '0.4rem 0.35rem' : '1rem 0.85rem', textAlign: 'right', flex: 1 }}>
 
           {/* --- UI RENDER BRANCHING --- */}
-          {mode === 'sprint' || mode === 'versus' ? (
+          {mode === 'sprint' ? (
             <>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Time</p>
-                <p ref={timeDisplayRef} style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: '#e5729f', fontWeight: 'bold', textShadow: '0 0 8px rgba(229,114,159,0.5)', margin: 0, fontVariantNumeric: 'tabular-nums' }}>
+                <p ref={timeDisplayRef} style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: 'var(--tt-accent)', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)', margin: 0, fontVariantNumeric: 'tabular-nums' }}>
                   00:00.000
                 </p>
               </div>
@@ -1460,12 +1873,45 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                   {Math.max(0, SPRINT_GOAL - uiState.lines)}
                 </p>
               </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>PPS</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{pps.toFixed(2)}</p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>APM</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{apm.toFixed(0)}</p>
+              </div>
+            </>
+          ) : mode === 'versus' ? (
+            <>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Time</p>
+                <p ref={timeDisplayRef} style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: 'var(--tt-accent)', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)', margin: 0, fontVariantNumeric: 'tabular-nums' }}>
+                  00:00.000
+                </p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Sent</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{linesSent}</p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>PPS</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{pps.toFixed(2)}</p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>APM</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{apm.toFixed(0)}</p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Attack/Min</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{attackPerMin.toFixed(1)}</p>
+              </div>
             </>
           ) : mode === 'blitz' ? (
             <>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Score</p>
-                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: '#e5729f', fontWeight: 'bold', textShadow: '0 0 8px rgba(229,114,159,0.5)', margin: 0 }}>{uiState.score}</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'var(--tt-accent)', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)', margin: 0 }}>{uiState.score}</p>
               </div>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Time Left</p>
@@ -1477,6 +1923,14 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Lines</p>
                 <p style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{uiState.lines}</p>
               </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>PPS</p>
+                <p style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{pps.toFixed(2)}</p>
+              </div>
+              <div>
+                <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>APM</p>
+                <p style={{ fontSize: isMobile ? '0.8rem' : '1.125rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{apm.toFixed(0)}</p>
+              </div>
             </>
           ) : (
             // Sandbox mode: score is back (good for testing combos/B2B/the
@@ -1486,7 +1940,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
             <>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Score</p>
-                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: '#e5729f', fontWeight: 'bold', textShadow: '0 0 8px rgba(229,114,159,0.5)', margin: 0 }}>{uiState.score}</p>
+                <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'var(--tt-accent)', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 50%, transparent)', margin: 0 }}>{uiState.score}</p>
               </div>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Time</p>
@@ -1507,7 +1961,7 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
 
           <div style={{ marginTop: 'auto', minHeight: isMobile ? '1rem' : '4rem', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
             {uiState.actionText && (
-               <p style={{ color: '#e5729f', fontSize: isMobile ? '8px' : '11px', fontWeight: 'bold', textShadow: '0 0 8px rgba(229,114,159,0.8)', margin: 0, lineHeight: 1.4, textTransform: 'uppercase' }}>
+               <p style={{ color: 'var(--tt-accent)', fontSize: isMobile ? '8px' : '11px', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 80%, transparent)', margin: 0, lineHeight: 1.4, textTransform: 'uppercase' }}>
                  {uiState.actionText.split('\n').map((line, i) => <React.Fragment key={i}>{line}<br/></React.Fragment>)}
                </p>
             )}
@@ -1515,7 +1969,65 @@ export default function TetrisGame({ mode, onMenu }: TetrisGameProps) {
         </div>
       </div>
 
-    </div>{/* end inner row (Left Panel / Center Panel / Right Panel) */}
+      {/* Opponent board, 1v1 only — sits further right than the Right Panel
+          (stats stay closest to the player's own board; the opponent's board
+          is the thing being compared, so it reads left-to-right as "mine,
+          my stats, theirs"), at 90% of the main board's size (see
+          isDesktopOneVOne above). A fuller room falls back to the compact
+          side-column preview below instead. */}
+      {isDesktopOneVOne && previewBoards.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'center', flexShrink: 0, paddingTop: '1rem' }}>
+          <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: '3px 10px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
+            OPPONENT
+          </p>
+          {/* Same gating as the player's own Lives tag above the main board
+              — only shown once the match actually has lives turned on. */}
+          {(lives ?? 1) > 1 && (
+            <p style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.6)', letterSpacing: '0.08em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: '2px 8px', backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '4px' }}>
+              {previewBoards[0].livesRemaining} / {lives} LIVES
+            </p>
+          )}
+          <MiniBoard board={previewBoards[0].board} cellSize={oneVOneCellSize} gap={ONE_V_ONE_GAP} padding={ONE_V_ONE_PADDING} pieceMatrix={previewBoards[0].pieceMatrix} pieceX={previewBoards[0].pieceX} pieceY={previewBoards[0].pieceY} eliminated={previewBoards[0].eliminated} />
+        </div>
+      )}
+
+      {/* Opponent Previews — versus-only compact column, one MiniBoard per
+          opponent (see onBoardUpdate in lockPiece and previewBoards above).
+          Used for a fuller room (isDesktopOneVOne's big adjacent board above
+          handles the true-1v1 desktop case instead) and for mobile, where
+          there's no reliable fixed main-board pixel width to size an
+          adjacent board off of. Wraps so it scales from a couple of
+          opponents up to a full room without a per-count layout. A single
+          opponent (mobile 1v1) still gets a size bump over a fuller room,
+          just not the full side-by-side treatment. */}
+      {mode === 'versus' && !isDesktopOneVOne && previewBoards.length > 0 && (() => {
+        const isOneVOne = previewBoards.length === 1;
+        const cellSize = isOneVOne ? 7.5 : 5;
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', width: isOneVOne ? '9rem' : '6rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem' }}>
+            <p style={{ fontSize: isMobile ? '0.55rem' : '0.7rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
+              {isOneVOne ? 'OPPONENT' : 'OPPONENTS'}
+            </p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center', maxHeight: isMobile ? 'none' : '600px', overflowY: 'auto' }}>
+              {previewBoards.map((entry) => (
+                <div key={entry.guestId} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.15rem' }}>
+                  {/* Each opponent needs their own count here (unlike the
+                      shared OPPONENT/OPPONENTS label above), since lives
+                      remaining can differ from one to the next. */}
+                  {(lives ?? 1) > 1 && (
+                    <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.6)', fontWeight: 'bold' }}>
+                      {entry.livesRemaining} / {lives}
+                    </span>
+                  )}
+                  <MiniBoard board={entry.board} cellSize={cellSize} pieceMatrix={entry.pieceMatrix} pieceX={entry.pieceX} pieceY={entry.pieceY} eliminated={entry.eliminated} />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+    </div>{/* end inner row (Left Panel / Center Panel / Right Panel / Opponent Previews) */}
 
       {/* Touch controls — mobile only. There's no keyboard on a phone, so
           this is the only way to move/rotate/drop/hold there. */}
