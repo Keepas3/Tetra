@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { MAX_ROOM_SIZE } from './useOnlineRoom';
+import { MAX_ROOM_SIZE, QUICK_CHAT_MESSAGES, type QuickChatEntry } from './useOnlineRoom';
+import ControlsSettings from './ControlsSettings';
 
 // Guideline-style speed curve tops out well before this (see
 // calculateDropInterval in TetrisGame.tsx) — 15 is already close to instant
@@ -59,11 +60,15 @@ interface OnlineLobbyProps {
   // the choose screen (teardown already dropped roomCode back to null by
   // the time this renders).
   wasKicked: boolean;
+  // Room-scoped preset chat (see QUICK_CHAT_MESSAGES in useOnlineRoom) —
+  // only shown once actually in a room, there's no one to talk to before that.
+  quickChatLog: QuickChatEntry[];
+  sendQuickChat: (messageId: number) => void;
 }
 
 const PANEL_STYLE: React.CSSProperties = {
   width: '100%',
-  maxWidth: '340px',
+  maxWidth: '380px',
   backgroundColor: 'rgba(5,5,8,0.72)',
   backdropFilter: 'blur(10px)',
   WebkitBackdropFilter: 'blur(10px)',
@@ -126,6 +131,38 @@ const SETTING_SELECT_STYLE: React.CSSProperties = {
   outline: 'none',
 };
 
+// Narrower than PANEL_STYLE and fixed-width rather than maxWidth — it sits
+// beside the main panel (see the outer row below), not in place of it. Same
+// width as ControlsSettings' own panel so the two side columns read as a
+// matched pair flanking the main one.
+const QUICK_CHAT_PANEL_STYLE: React.CSSProperties = {
+  width: '210px',
+  flexShrink: 0,
+  backgroundColor: 'rgba(5,5,8,0.72)',
+  backdropFilter: 'blur(10px)',
+  WebkitBackdropFilter: 'blur(10px)',
+  border: '1px solid rgba(255,255,255,0.1)',
+  borderRadius: '8px',
+  padding: '0.85rem',
+  boxShadow: '0 10px 35px rgba(0,0,0,0.45)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '0.6rem',
+};
+
+const QUICK_CHAT_BUTTON_STYLE: React.CSSProperties = {
+  backgroundColor: 'rgba(255,255,255,0.06)',
+  border: '1px solid rgba(255,255,255,0.15)',
+  color: 'rgba(255,255,255,0.85)',
+  padding: '6px 8px',
+  fontSize: '0.65rem',
+  cursor: 'pointer',
+  borderRadius: '4px',
+  textAlign: 'left',
+  fontFamily: 'monospace',
+  lineHeight: 1.3,
+};
+
 export default function OnlineLobby({
   onStart, onCancel, initialCode,
   roomCode, isHost, opponents, selfReady, readyGuestIds, startAt,
@@ -133,6 +170,7 @@ export default function OnlineLobby({
   quickplayStatus, onQuickplaySearch, onQuickplayCancel,
   winCount,
   nickname, setNickname, hostGuestId, roomSettings, setMaxPlayers, setStartingLevel, setLives, sendKick, wasKicked,
+  quickChatLog, sendQuickChat,
 }: OnlineLobbyProps) {
   const [entryMode, setEntryMode] = useState<'choose' | 'joining'>('choose');
   const [joinCodeInput, setJoinCodeInput] = useState('');
@@ -140,6 +178,14 @@ export default function OnlineLobby({
   const [linkCopied, setLinkCopied] = useState(false);
   const startedRef = useRef(false);
   const autoJoinedRef = useRef(false);
+  const chatLogEndRef = useRef<HTMLDivElement>(null);
+
+  // Keeps the newest message in view without the whole page scrolling —
+  // 'nearest' so it's a no-op while the log already fits (i.e. hasn't
+  // started scrolling yet).
+  useEffect(() => {
+    chatLogEndRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [quickChatLog]);
 
   useEffect(() => {
     if (initialCode && !autoJoinedRef.current) {
@@ -182,16 +228,21 @@ export default function OnlineLobby({
   }, [wasKicked]);
 
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        gap: '1.5rem',
-        color: 'white',
-        fontFamily: 'monospace',
-      }}
-    >
+    // width:100% + alignItems:'stretch' matter here, not just centering:
+    // VersusApp's own wrapper is a flex row with alignItems:'center'
+    // (shrink-to-fit), so without an explicit width this container has no
+    // real width for its own children to lay out against; alignItems on
+    // *this* container being 'center' (rather than the default 'stretch')
+    // compounds it one level down, shrink-wrapping the row itself too. Net
+    // effect without both fixes: the row's flexWrap has nothing to measure
+    // "available space" against and wraps every child onto its own line
+    // immediately regardless of viewport width (confirmed live: the row
+    // rendered at ~422px wide, narrower than even one side panel plus the
+    // main panel, wrapping Controls below everything instead of beside it).
+    // The title/paragraph below still read as centered even though this
+    // container no longer shrink-wraps them, since they center themselves
+    // via their own textAlign, not via being sized to their content here.
+    <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '1.5rem', color: 'white', fontFamily: 'monospace' }}>
       <div style={{ textAlign: 'center' }}>
         <h1 style={{ fontSize: '2rem', color: 'var(--tt-accent)', textShadow: '0 2px 6px rgba(0,0,0,0.85), 0 0 20px color-mix(in srgb, var(--tt-accent) 80%, transparent)', margin: '0 0 0.4rem 0', letterSpacing: '0.15em' }}>
           1V1 ONLINE
@@ -200,6 +251,50 @@ export default function OnlineLobby({
           BETA — LAST PLAYER STANDING WINS
         </p>
       </div>
+
+      {/* Three columns, all stretched to match whichever is tallest (see
+          alignItems below) — chat and controls are both room-independent
+          asides flanking the actual lobby panel in the middle, not part of
+          the same "container" it is, hence being pulled out to siblings of
+          it rather than nested inside. Quick chat only appears once
+          actually in a room (see roomCode below), but Controls is a purely
+          local preference with no room dependency, so it's always shown —
+          including on the pre-room choose screen, which used to be a lone
+          narrow panel in a lot of otherwise-empty space. */}
+      <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'stretch', justifyContent: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
+      {/* Quick chat — only once actually in a room (see roomCode below);
+          sits to the left of the main panel rather than inside it, so it
+          doesn't push the room-code/settings/ready UI around as messages
+          come in. */}
+      {roomCode && (
+        <div style={QUICK_CHAT_PANEL_STYLE}>
+          <p style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.5)', letterSpacing: '0.15em', textTransform: 'uppercase', margin: 0, textAlign: 'center' }}>
+            Quick Chat
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: 1, minHeight: '3.5rem', overflowY: 'auto' }}>
+            {quickChatLog.length === 0 ? (
+              <span style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.35)' }}>No messages yet</span>
+            ) : (
+              quickChatLog.map((entry) => (
+                <p key={entry.id} style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.8)', margin: 0, lineHeight: 1.4, wordBreak: 'break-word' }}>
+                  <span style={{ color: 'var(--tt-accent)', fontWeight: 'bold' }}>
+                    {entry.nickname || entry.guestId.slice(0, 4).toUpperCase()}:
+                  </span>{' '}
+                  {QUICK_CHAT_MESSAGES[entry.messageId]}
+                </p>
+              ))
+            )}
+            <div ref={chatLogEndRef} />
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '0.6rem' }}>
+            {QUICK_CHAT_MESSAGES.map((msg, i) => (
+              <button key={i} onClick={() => sendQuickChat(i)} style={QUICK_CHAT_BUTTON_STYLE}>
+                {msg}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div style={PANEL_STYLE}>
         {/* Always visible regardless of which sub-screen below is showing —
@@ -217,13 +312,23 @@ export default function OnlineLobby({
           />
         </div>
 
-        {!roomCode && initialCode && (
+        {/* initialCode (from a shared join link) stays truthy for this
+            component's whole lifetime — VersusApp only blanks it out while
+            actually in a room (roomCode truthy), so getting kicked drops
+            roomCode back to null and this condition would otherwise become
+            true again forever, stranding a link-joiner on "Joining room…"
+            with no buttons ever reachable (the choose screen below was
+            gated on !initialCode, which never becomes true for them). The
+            !wasKicked guard here, paired with the (!initialCode ||
+            wasKicked) guard below, is what actually gets them back to a
+            screen with buttons on it. */}
+        {!roomCode && initialCode && !wasKicked && (
           <p style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)', fontSize: '0.85rem', margin: 0 }}>
             Joining room {initialCode}…
           </p>
         )}
 
-        {!roomCode && !initialCode && entryMode === 'choose' && quickplayStatus === 'idle' && (
+        {!roomCode && (!initialCode || wasKicked) && entryMode === 'choose' && quickplayStatus === 'idle' && (
           <>
             {wasKicked && (
               <p style={{ textAlign: 'center', color: '#f87171', fontSize: '0.75rem', margin: 0 }}>
@@ -237,7 +342,7 @@ export default function OnlineLobby({
           </>
         )}
 
-        {!roomCode && !initialCode && quickplayStatus === 'searching' && (
+        {!roomCode && (!initialCode || wasKicked) && quickplayStatus === 'searching' && (
           <>
             <p style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)', fontSize: '0.85rem', margin: 0 }}>
               Searching for an opponent…
@@ -246,7 +351,7 @@ export default function OnlineLobby({
           </>
         )}
 
-        {!roomCode && !initialCode && entryMode === 'joining' && (
+        {!roomCode && (!initialCode || wasKicked) && entryMode === 'joining' && (
           <>
             <input
               autoFocus
@@ -409,6 +514,9 @@ export default function OnlineLobby({
             <button style={SECONDARY_BUTTON_STYLE} onClick={handleLeave}>Leave Room</button>
           </>
         )}
+      </div>
+
+      <ControlsSettings />
       </div>
     </div>
   );

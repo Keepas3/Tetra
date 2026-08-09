@@ -18,6 +18,21 @@ import { supabase } from '../app/utils/supabaseClient';
 
 export const MAX_ROOM_SIZE = 8;
 
+// Preset quick-chat messages — index into this array is the only thing that
+// crosses the wire (see QuickChatPayload), so there's no free-text input to
+// moderate and no keyboard focus fight with the game's own key bindings.
+export const QUICK_CHAT_MESSAGES = [
+  'Good luck!',
+  'Good game!',
+  'Have to go, sorry',
+  "Start the game already! 14",
+  'One sec, wait for more',
+  'Nice one!',
+  'Oops, my bad',
+  'Rematch?',
+  'Thanks!',
+] as const;
+
 export type RoomStatus = 'idle' | 'connecting' | 'waiting' | 'occupied';
 
 interface ReadyPayload {
@@ -51,6 +66,12 @@ interface PresenceMeta {
   maxPlayers?: number;
   startingLevel?: number;
   lives?: number;
+  // When this client originally joined — fixed at join time (see joinedAtRef),
+  // not updated by retrack(). Not part of `meta` at either track() call site
+  // (added alongside it as a sibling field instead — see joinChannel/retrack),
+  // hence optional here; used to pick a deterministic successor if the host
+  // disconnects with no replacement (see the presence-sync handler).
+  joinedAt?: number;
 }
 
 interface GarbagePayload {
@@ -81,6 +102,22 @@ interface BoardSnapshotPayload {
   // setting is above the 1-life default) — lets an opponent-preview show it
   // per-opponent without a separate broadcast.
   livesRemaining: number;
+}
+
+interface QuickChatPayload {
+  guestId: string;
+  // Carried on the payload itself (not looked up from `opponents` on
+  // receipt) so a message still shows the sender's name correctly even if
+  // they change their nickname or leave right after sending.
+  nickname: string;
+  // Index into QUICK_CHAT_MESSAGES.
+  messageId: number;
+}
+
+// A received (or self-sent) quick-chat line, ready to render — `id` is a
+// local sequence number for React keys, not anything sent over the wire.
+export interface QuickChatEntry extends QuickChatPayload {
+  id: number;
 }
 
 // Avoids visually-ambiguous characters (0/O, 1/I) since players read these
@@ -131,9 +168,15 @@ export function useOnlineRoom() {
   // to the choose screen. Deliberately not reset by teardown() itself (a
   // kick triggers teardown internally); only a fresh joinChannel clears it.
   const [wasKicked, setWasKicked] = useState(false);
+  // Room-scoped, not match-scoped — survives a Rematch (same conversation,
+  // same room) but clears on teardown() like the rest of this list, since
+  // leaving the room is leaving the conversation. Capped in setQuickChatLog
+  // itself so an idle-but-connected tab can't accumulate an unbounded log.
+  const [quickChatLog, setQuickChatLog] = useState<QuickChatEntry[]>([]);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const guestIdRef = useRef(randomGuestId());
+  const quickChatSeqRef = useRef(0);
   const garbageSeqRef = useRef(0);
   // Mirrors `opponents` so the presence-sync handler can diff against the
   // previous snapshot (a plain closure over `opponents` state would be stale
@@ -196,6 +239,7 @@ export function useOnlineRoom() {
     setHostGuestId(null);
     setRoomSettings(DEFAULT_ROOM_SETTINGS);
     roomSettingsRef.current = DEFAULT_ROOM_SETTINGS;
+    setQuickChatLog([]);
   }, []);
 
   const joinChannel = useCallback((code: string, host: boolean) => {
@@ -239,7 +283,11 @@ export function useOnlineRoom() {
       // The host's own presence entry carries the room's current settings —
       // any client (including one that just joined) can read maxPlayers/
       // startingLevel/lives straight off it instead of needing a live host to
-      // rebroadcast them on request.
+      // rebroadcast them on request. Kept in roomSettingsRef unconditionally
+      // (not just for the current host) so that if this client is the one
+      // that ends up self-promoting below, it retracks with the room's real
+      // last-known settings instead of whatever default this ref happened to
+      // start at.
       const hostEntry = Object.entries(state).find(([, metas]) => metas[0]?.isHost);
       setHostGuestId(hostEntry?.[0] ?? null);
       if (hostEntry) {
@@ -250,7 +298,28 @@ export function useOnlineRoom() {
           lives: meta.lives ?? 1,
         };
         setRoomSettings(nextSettings);
-        if (isHostRef.current) roomSettingsRef.current = nextSettings;
+        roomSettingsRef.current = nextSettings;
+      } else if (!isHostRef.current) {
+        // No one is currently host — the original host disconnected (or was
+        // kicked/left) without anyone taking over, which otherwise leaves the
+        // room permanently stuck: no host means no one is ever allowed to
+        // edit settings, and the host-decides-start effect below never fires
+        // for anyone, so a match can never start again either. Every
+        // remaining client sees the same presence snapshot, so whoever has
+        // been in the room longest (earliest joinedAt, a stable tiebreak
+        // available to everyone) can self-promote without negotiating with
+        // the others — same no-server, compute-independently approach
+        // quickplay's grouping already relies on.
+        const candidates = Object.entries(state).map(([key, metas]) => ({
+          guestId: key,
+          joinedAt: metas[0]?.joinedAt ?? Number.MAX_SAFE_INTEGER,
+        }));
+        const earliest = candidates.reduce((a, b) => (b.joinedAt < a.joinedAt ? b : a));
+        if (earliest.guestId === guestId) {
+          isHostRef.current = true;
+          setIsHost(true);
+          retrack();
+        }
       }
 
       setOpponents(others);
@@ -279,6 +348,19 @@ export function useOnlineRoom() {
     channel.on('broadcast', { event: 'eliminated' }, ({ payload }: { payload: EliminatedPayload }) => {
       if (payload.guestId === guestId) return;
       setEliminatedGuestIds((prev) => new Set(prev).add(payload.guestId));
+    });
+
+    // Filtered by guestId === self, same as the other broadcasts — Supabase
+    // doesn't echo a client's own send back to it (self:false is this
+    // channel's default), so this filter is normally a no-op, but
+    // sendQuickChat below already appends the sent message locally itself
+    // (same optimistic-update pattern sendReady uses for selfReady); without
+    // the filter, a config change enabling self-echo later would silently
+    // start double-posting every message this client sends.
+    channel.on('broadcast', { event: 'quickchat' }, ({ payload }: { payload: QuickChatPayload }) => {
+      if (payload.guestId === guestId) return;
+      quickChatSeqRef.current += 1;
+      setQuickChatLog((prev) => [...prev, { id: quickChatSeqRef.current, ...payload }].slice(-30));
     });
 
     channel.on('broadcast', { event: 'board-snapshot' }, ({ payload }: { payload: BoardSnapshotPayload }) => {
@@ -311,7 +393,7 @@ export function useOnlineRoom() {
     });
 
     channelRef.current = channel;
-  }, [teardown]);
+  }, [teardown, retrack]);
 
   const createRoom = useCallback(() => {
     const code = randomRoomCode();
@@ -363,6 +445,17 @@ export function useOnlineRoom() {
       event: 'board-snapshot',
       payload: { guestId: guestIdRef.current, board, pieceMatrix, pieceX, pieceY, livesRemaining } satisfies BoardSnapshotPayload,
     });
+  }, []);
+
+  // messageId indexes QUICK_CHAT_MESSAGES. Appends to this client's own log
+  // immediately (self:false means the broadcast alone wouldn't do it — see
+  // the quickchat listener above) rather than waiting on a round trip, so
+  // sending your own message feels instant.
+  const sendQuickChat = useCallback((messageId: number) => {
+    const payload: QuickChatPayload = { guestId: guestIdRef.current, nickname: nicknameRef.current, messageId };
+    quickChatSeqRef.current += 1;
+    setQuickChatLog((prev) => [...prev, { id: quickChatSeqRef.current, ...payload }].slice(-30));
+    channelRef.current?.send({ type: 'broadcast', event: 'quickchat', payload });
   }, []);
 
   // Clamped to 4 chars per the lobby's design (a short name that still fits
@@ -486,5 +579,7 @@ export function useOnlineRoom() {
     sendBoardUpdate,
     resetMatchReady,
     leaveRoom: teardown,
+    quickChatLog,
+    sendQuickChat,
   };
 }

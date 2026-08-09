@@ -24,7 +24,7 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
   // but the last-player-standing win condition needs a denominator that can't
   // move under a running match. Re-snapshots naturally on every rematch too,
   // since onStart fires again each time.
-  const [matchOpponents, setMatchOpponents] = useState<{ guestId: string }[]>([]);
+  const [matchOpponents, setMatchOpponents] = useState<{ guestId: string; nickname: string }[]>([]);
   // Session-scoped, not persisted — resets on a full leave (Quit) but
   // survives rematches, since staying in the same room is exactly when a
   // running count should keep counting.
@@ -80,6 +80,8 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           setLives={room.setLives}
           sendKick={room.sendKick}
           wasKicked={room.wasKicked}
+          quickChatLog={room.quickChatLog}
+          sendQuickChat={room.sendQuickChat}
         />
       )}
 
@@ -96,8 +98,8 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           incomingGarbage={room.incomingGarbage}
           onEliminated={room.sendEliminated}
           eliminatedOpponentIds={Array.from(room.eliminatedGuestIds)}
-          opponentCount={matchOpponents.length}
           opponentIds={matchOpponents.map((o) => o.guestId)}
+          opponentNicknames={Object.fromEntries(matchOpponents.map((o) => [o.guestId, o.nickname]))}
           seed={room.matchSeed ?? undefined}
           startingLevel={room.matchStartingLevel ?? undefined}
           lives={room.matchLives ?? undefined}

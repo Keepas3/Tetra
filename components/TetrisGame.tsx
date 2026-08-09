@@ -14,13 +14,17 @@ interface TetrisGameProps {
   incomingGarbage?: { amount: number; seq: number } | null;
   // Win condition is last-player-standing: onEliminated fires once when this
   // client tops out, eliminatedOpponentIds grows as opponents broadcast their
-  // own eliminations, and opponentCount is the match's starting roster size
-  // (a snapshot, not live presence — see VersusApp) — once
-  // eliminatedOpponentIds covers everyone, this client has outlasted the room.
+  // own eliminations, and opponentIds is the match's starting roster (a
+  // snapshot, not live presence — see VersusApp) — once every id in
+  // opponentIds also appears in eliminatedOpponentIds, this client has
+  // outlasted the room. Checking actual membership (not just comparing
+  // lengths) matters: eliminatedOpponentIds is a room-lifetime set that only
+  // gets cleared on rematch, so a stale id left over from a previous match
+  // could otherwise satisfy a plain count check against a brand new,
+  // unrelated roster.
   onEliminated?: () => void;
   eliminatedOpponentIds?: string[];
-  opponentCount?: number;
-  // Full match roster (same snapshot opponentCount is derived from), used to
+  // Full match roster, used both by the win-condition check above and to
   // seed a preview slot for every opponent from the moment the match starts
   // — opponentBoards below only gets an entry once that opponent's first
   // piece locks, so without this, previews would pop in one at a time as a
@@ -52,6 +56,11 @@ interface TetrisGameProps {
   // position from. livesRemaining is their current life count (see `lives`).
   onBoardUpdate?: (board: number[][], pieceMatrix: number[][], pieceX: number, pieceY: number, livesRemaining: number) => void;
   opponentBoards?: { guestId: string; board: number[][]; pieceMatrix: number[][]; pieceX: number; pieceY: number; livesRemaining: number }[];
+  // guestId -> nickname, from the same match-start roster snapshot opponentIds
+  // comes from — labels each preview board so previews read as "who," not
+  // just "how many." Falls back to a truncated guestId (matching OnlineLobby's
+  // own fallback) for anyone who never set one.
+  opponentNicknames?: Record<string, string>;
   // Fired once on a win — VersusApp owns the actual session win counter
   // (displayed in OnlineLobby instead of here, since this component fully
   // remounts every match and the counter needs to survive that).
@@ -339,7 +348,7 @@ const TouchControlButton = ({
 // 2. MAIN REACT COMPONENT
 // ==========================================
 
-export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, onEliminated, eliminatedOpponentIds, opponentCount, opponentIds, onRematchMenu, seed, startingLevel, lives, onBoardUpdate, opponentBoards, onMatchWin }: TetrisGameProps) {
+export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, onEliminated, eliminatedOpponentIds, opponentIds, onRematchMenu, seed, startingLevel, lives, onBoardUpdate, opponentBoards, opponentNicknames, onMatchWin }: TetrisGameProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timeDisplayRef = useRef<HTMLParagraphElement>(null);
   const requestRef = useRef<number>(0);
@@ -371,13 +380,6 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // both players' bags are identical; solo modes fall through to Math.random.
   const rngRef = useRef<() => number>(mode === 'versus' && seed != null ? mulberry32(seed) : Math.random);
   const nextPiecesRef = useRef<number[]>([...generateBag(rngRef.current), ...generateBag(rngRef.current)]);
-  // Captured once, synchronously, on first render — before playerReset()
-  // (which runs in the mount effect below) ever shifts nextPiecesRef. Since
-  // versus mode's bag is seeded identically for everyone, this is also every
-  // opponent's first piece, not just this client's — used as the preview
-  // placeholder's active piece before an opponent's own first lock actually
-  // broadcasts one (see previewBoards below).
-  const initialPieceTypeRef = useRef<number>(nextPiecesRef.current[0]);
   const holdPieceRef = useRef<number | null>(null);
   const canHoldRef = useRef(true);
 
@@ -457,14 +459,15 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // this double-firing against a local handleGameOver call already in flight.
   useEffect(() => {
     if (mode !== 'versus' || matchEndedRef.current) return;
-    if (!opponentCount || (eliminatedOpponentIds?.length ?? 0) < opponentCount) return;
+    if (!opponentIds || opponentIds.length === 0) return;
+    if (!opponentIds.every((id) => eliminatedOpponentIds?.includes(id))) return;
     matchEndedRef.current = true;
     scoreRef.current = elapsedTimeRef.current;
     setVersusOutcome('won-last-standing');
     setGameState('LEADERBOARD');
     onMatchWin?.();
     syncUi();
-  }, [mode, eliminatedOpponentIds, opponentCount]);
+  }, [mode, eliminatedOpponentIds, opponentIds]);
 
   const [listeningAction, setListeningAction] = useState<string | null>(null);
   const listeningActionRef = useRef<string | null>(null);
@@ -1453,18 +1456,20 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // opponent places their first piece instead of all showing up (empty)
   // immediately. Falls back to opponentBoards' own guestIds if opponentIds
   // wasn't passed, matching the old behavior.
-  // Placeholder piece for an opponent whose own first broadcast hasn't
-  // arrived yet — versus's bag is seeded identically for everyone (see
-  // initialPieceTypeRef above), so this is provably their real first piece,
-  // at the same spawn position playerReset() itself would use.
-  const initialPieceMatrix = PIECES[initialPieceTypeRef.current];
-  const initialPieceX = Math.floor(COLS / 2) - Math.floor(initialPieceMatrix[0].length / 2);
+  // An opponent whose own first broadcast hasn't arrived yet gets a plain
+  // empty board with no piece overlay — deliberately not a guessed piece
+  // (a prior version rendered everyone's provably-identical first piece from
+  // the shared seed here, but that meant the preview always briefly showed a
+  // piece that then visibly snapped to the real one once actual data
+  // arrived). No piece is genuinely more accurate than a guessed one: it
+  // reads as "waiting for data," not as a wrong answer.
   const previewBoards = (opponentIds ?? opponentBoards?.map((b) => b.guestId) ?? []).map((guestId) => {
     const real = opponentBoards?.find((b) => b.guestId === guestId);
     const eliminated = eliminatedOpponentIds?.includes(guestId) ?? false;
+    const nickname = opponentNicknames?.[guestId] || guestId.slice(0, 4).toUpperCase();
     return real
-      ? { ...real, eliminated }
-      : { guestId, board: EMPTY_MINI_BOARD, pieceMatrix: initialPieceMatrix, pieceX: initialPieceX, pieceY: 0, eliminated, livesRemaining: lives ?? 1 };
+      ? { ...real, eliminated, nickname }
+      : { guestId, board: EMPTY_MINI_BOARD, pieceMatrix: undefined, pieceX: 0, pieceY: 0, eliminated, livesRemaining: lives ?? 1, nickname };
   });
 
   // A genuine 1v1 (exactly one opponent) on a desktop-sized viewport gets its
@@ -1475,15 +1480,16 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // static pixel width for the main board there — it's a CSS min() against
   // viewport width — so there's nothing reliable to size 90% of).
   const isDesktopOneVOne = mode === 'versus' && !isMobile && previewBoards.length === 1;
-  // Main board is a fixed COLS*BLOCK_SIZE (300px) canvas on desktop; 90% of
-  // that. Fixed (not cellSize-proportional) gap/padding here — see MiniBoard
-  // above for why — so solving total-width = COLS*cellSize + (COLS-1)*gap +
+  // Main board is a fixed COLS*BLOCK_SIZE (300px) canvas on desktop — sized
+  // to match it exactly (100%), per feedback that a genuine 1v1 should read
+  // as "their board, same size as mine," not a slightly-smaller preview.
+  // Fixed (not cellSize-proportional) gap/padding here — see MiniBoard above
+  // for why — so solving total-width = COLS*cellSize + (COLS-1)*gap +
   // 2*padding for cellSize lands the *whole board*, not just its cells, at
-  // that 90% target, and the height comes out at essentially the same 90%
-  // too rather than visibly short.
+  // that target.
   const ONE_V_ONE_GAP = 1;
   const ONE_V_ONE_PADDING = 4;
-  const oneVOneBoardWidth = COLS * BLOCK_SIZE * 0.9;
+  const oneVOneBoardWidth = COLS * BLOCK_SIZE;
   const oneVOneCellSize = (oneVOneBoardWidth - 2 * ONE_V_ONE_PADDING - (COLS - 1) * ONE_V_ONE_GAP) / COLS;
 
   return (
@@ -1844,8 +1850,18 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       </div>
       </div>
 
-      {/* Right Panel */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.5rem' : '2rem', width: isMobile ? '4rem' : '7rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem', alignItems: 'stretch', justifyContent: 'flex-start', height: isMobile ? 'auto' : '600px' }}>
+      {/* Right Panel. Height is intrinsic (content-driven), not pinned to the
+          main board's 600px — versus's 5-row stats box (Time/Sent/PPS/APM/
+          Attack-Min) is taller than that budget once the NEXT box above it
+          is accounted for, and a fixed height here just pushed the overflow
+          past the board's bottom edge rather than preventing it (flex:1 on
+          the stats box below doesn't help either — with negative free space
+          it still bottoms out at the same content-driven size). Letting the
+          column size itself means the stats box's own background/border
+          simply ends right after its last row's padding, which is what
+          should visually "cap" it, even though the column can now end up
+          taller than the board on modes with more stat rows. */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.5rem' : '2rem', width: isMobile ? '4rem' : '7rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem', alignItems: 'stretch', justifyContent: 'flex-start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.4rem' : '0.75rem' }}>
           <p style={{ fontSize: isMobile ? '0.55rem' : '0.75rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>NEXT</p>
           <div style={{ width: isMobile ? '4rem' : '7rem', backgroundColor: 'rgba(0,0,0,0.6)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '0.375rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'space-between', padding: isMobile ? '0.4rem 0' : '1rem 0', gap: isMobile ? '0.4rem' : '1.5rem', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.6)', margin: '0 auto' }}>
@@ -1856,7 +1872,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         {/* Solid backdrop (matching the Hold/Next boxes) so these numbers stay
             readable no matter how bright or busy the selected background is —
             plain text sitting directly on the theme image used to wash out. */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.5rem' : '1rem', backgroundColor: 'rgba(0,0,0,0.75)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '0.375rem', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.6)', padding: isMobile ? '0.4rem 0.35rem' : '1rem 0.85rem', textAlign: 'right', flex: 1 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: isMobile ? '0.5rem' : '1rem', backgroundColor: 'rgba(0,0,0,0.75)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '0.375rem', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.6)', padding: isMobile ? '0.4rem 0.35rem' : '1rem 0.85rem', textAlign: 'right' }}>
 
           {/* --- UI RENDER BRANCHING --- */}
           {mode === 'sprint' ? (
@@ -1959,7 +1975,12 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
             </>
           )}
 
-          <div style={{ marginTop: 'auto', minHeight: isMobile ? '1rem' : '4rem', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+          {/* Transient combo/T-spin/top-out text — no reserved space when
+              idle (previously a fixed 4rem placeholder sat here at all
+              times, pushing the box well past its actual stat rows); it
+              just briefly grows the box while a message is showing, same as
+              any other row would. */}
+          <div>
             {uiState.actionText && (
                <p style={{ color: 'var(--tt-accent)', fontSize: isMobile ? '8px' : '11px', fontWeight: 'bold', textShadow: '0 0 8px color-mix(in srgb, var(--tt-accent) 80%, transparent)', margin: 0, lineHeight: 1.4, textTransform: 'uppercase' }}>
                  {uiState.actionText.split('\n').map((line, i) => <React.Fragment key={i}>{line}<br/></React.Fragment>)}
@@ -1977,8 +1998,10 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           side-column preview below instead. */}
       {isDesktopOneVOne && previewBoards.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'center', flexShrink: 0, paddingTop: '1rem' }}>
+          {/* A true 1v1 just needs to say who, not "opponent" plus who —
+              there's only one, so the nickname alone is the label. */}
           <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: '3px 10px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
-            OPPONENT
+            {previewBoards[0].nickname}
           </p>
           {/* Same gating as the player's own Lives tag above the main board
               — only shown once the match actually has lives turned on. */}
@@ -2002,15 +2025,28 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           just not the full side-by-side treatment. */}
       {mode === 'versus' && !isDesktopOneVOne && previewBoards.length > 0 && (() => {
         const isOneVOne = previewBoards.length === 1;
-        const cellSize = isOneVOne ? 7.5 : 5;
+        // Multi-opponent bumped 10% over its old 5px base, per feedback that
+        // a fuller room's previews read too small.
+        const cellSize = isOneVOne ? 7.5 : 5.5;
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', width: isOneVOne ? '9rem' : '6rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem' }}>
+            {/* A true 1v1 (mobile, or a fuller room down to one survivor)
+                just needs the nickname — nothing to tell apart from. A
+                fuller room keeps the generic OPPONENTS heading up top and
+                labels each board individually below instead, since that's
+                the only place lives/nickname can actually differ board to
+                board. */}
             <p style={{ fontSize: isMobile ? '0.55rem' : '0.7rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
-              {isOneVOne ? 'OPPONENT' : 'OPPONENTS'}
+              {isOneVOne ? previewBoards[0].nickname : 'OPPONENTS'}
             </p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center', maxHeight: isMobile ? 'none' : '600px', overflowY: 'auto' }}>
               {previewBoards.map((entry) => (
                 <div key={entry.guestId} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.15rem' }}>
+                  {!isOneVOne && (
+                    <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.75)', fontWeight: 'bold', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                      {entry.nickname}
+                    </span>
+                  )}
                   {/* Each opponent needs their own count here (unlike the
                       shared OPPONENT/OPPONENTS label above), since lives
                       remaining can differ from one to the next. */}
