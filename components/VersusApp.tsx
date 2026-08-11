@@ -29,6 +29,18 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
   // survives rematches, since staying in the same room is exactly when a
   // running count should keep counting.
   const [winCount, setWinCount] = useState(0);
+  // A voluntary Quit tears down the room (room.roomCode -> null), which
+  // would otherwise make `initialCode` below fall back to initialRoomCode
+  // again — and initialRoomCode (from a /versus?code=XXX link) never
+  // clears itself, since the URL doesn't change. Without this flag, a
+  // player who joined via a shared link and hits Quit mid-match gets
+  // silently auto-rejoined into that same still-running room by
+  // OnlineLobby's own auto-join effect (its guard against re-firing is a
+  // ref scoped to one OnlineLobby mount, and Quit remounts it) — landing
+  // back on a Ready button for a match that already started without them.
+  // Quit is a deliberate "I'm done," so once it happens the link should
+  // never resurrect that room again for the rest of this page's lifetime.
+  const [hasQuit, setHasQuit] = useState(false);
 
   const handleAttack = useCallback((amount: number) => {
     const alive = matchOpponents.filter((o) => !room.eliminatedGuestIds.has(o.guestId));
@@ -54,7 +66,7 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           // shared link — once room.roomCode is set it stays set for this
           // component's whole lifetime, so this also prevents a rematch's
           // repeated OnlineLobby mounts from re-triggering a join.
-          initialCode={room.roomCode ? undefined : initialRoomCode}
+          initialCode={hasQuit ? undefined : (room.roomCode ? undefined : initialRoomCode)}
           onStart={() => { setMatchOpponents(room.opponents); setView('PLAYING'); }}
           onCancel={() => router.push('/')}
           roomCode={room.roomCode}
@@ -66,6 +78,7 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           createRoom={room.createRoom}
           joinRoom={room.joinRoom}
           sendReady={room.sendReady}
+          sendUnready={room.sendUnready}
           leaveRoom={room.leaveRoom}
           quickplayStatus={quickplay.status}
           onQuickplaySearch={quickplay.search}
@@ -78,21 +91,30 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           setMaxPlayers={room.setMaxPlayers}
           setStartingLevel={room.setStartingLevel}
           setLives={room.setLives}
+          setGameMode={room.setGameMode}
+          setSharedNextHold={room.setSharedNextHold}
           sendKick={room.sendKick}
           wasKicked={room.wasKicked}
+          roomFull={room.roomFull}
           quickChatLog={room.quickChatLog}
           sendQuickChat={room.sendQuickChat}
         />
       )}
 
-      {/* Quit (onMenu) fully leaves the room. Rematch (onRematchMenu) only
-          resets the ready/start state and returns to the same still-connected
-          room's lobby, so both players can ready up again without recreating
-          anything. */}
+      {/* onMenu (full leave) is required by TetrisGameProps for solo modes,
+          but is effectively unreachable here now: TetrisGame only calls it
+          from a room-aware match when isMultiplayerRoom is false, and every
+          mode VersusApp ever renders (versus/practice) is multiplayer. Mid-
+          match Quit is a group vote instead (quitVotes/selfQuitVote/
+          onQuitVote/onRetractQuitVote below) — a passed vote reuses
+          onRematchMenu, same as the post-match "Rematch" button, since both
+          mean "keep this room alive, go back to its lobby." Kept wired to
+          the same full-leave function anyway as a safe fallback rather than
+          a no-op, in case a future path ever does reach it. */}
       {view === 'PLAYING' && (
         <TetrisGame
-          mode="versus"
-          onMenu={() => { room.leaveRoom(); setWinCount(0); setView('LOBBY'); }}
+          mode={room.matchGameMode === 'practice' ? 'practice' : room.matchGameMode === 'coop' ? 'coop' : 'versus'}
+          onMenu={() => { room.leaveRoom(); setWinCount(0); setHasQuit(true); setView('LOBBY'); }}
           onRematchMenu={() => { room.resetMatchReady(); setView('LOBBY'); }}
           onAttack={handleAttack}
           incomingGarbage={room.incomingGarbage}
@@ -103,9 +125,15 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           seed={room.matchSeed ?? undefined}
           startingLevel={room.matchStartingLevel ?? undefined}
           lives={room.matchLives ?? undefined}
+          sharedNextHold={room.matchSharedNextHold ?? undefined}
           onBoardUpdate={room.sendBoardUpdate}
           opponentBoards={room.opponentBoards}
           onMatchWin={() => setWinCount((c) => c + 1)}
+          quitVotes={room.quitVotes}
+          selfQuitVote={room.selfQuitVote}
+          quitVoteDeadline={room.quitVoteDeadline}
+          onQuitVote={room.sendQuitVote}
+          onRetractQuitVote={room.retractQuitVote}
         />
       )}
     </div>

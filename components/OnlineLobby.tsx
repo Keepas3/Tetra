@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { MAX_ROOM_SIZE, QUICK_CHAT_MESSAGES, type QuickChatEntry } from './useOnlineRoom';
+import { MAX_ROOM_SIZE, QUICK_CHAT_MESSAGES, type QuickChatEntry, type GameMode } from './useOnlineRoom';
 import ControlsSettings from './ControlsSettings';
 
 // Guideline-style speed curve tops out well before this (see
@@ -30,6 +30,7 @@ interface OnlineLobbyProps {
   createRoom: () => string;
   joinRoom: (code: string) => void;
   sendReady: () => void;
+  sendUnready: () => void;
   leaveRoom: () => void;
   // Public matchmaking queue — owned by VersusApp (via useQuickplay), same
   // "hooks that outlive this component live in the parent" pattern as room.
@@ -49,10 +50,18 @@ interface OnlineLobbyProps {
   // Whichever opponent (or self) is hosting — drives the "(Host)" label and
   // gates the host-only settings/kick controls below.
   hostGuestId: string | null;
-  roomSettings: { maxPlayers: number; startingLevel: number; lives: number };
+  roomSettings: { maxPlayers: number; startingLevel: number; lives: number; gameMode: GameMode; sharedNextHold: boolean };
   setMaxPlayers: (n: number) => void;
   setStartingLevel: (n: number) => void;
   setLives: (n: number) => void;
+  // Practice mode (Sandbox's ruleset in a shared room, no attacks/lives/
+  // elimination) is the first of several planned game modes — see
+  // useOnlineRoom's GameMode type.
+  setGameMode: (m: GameMode) => void;
+  // Co-op only — whether Hold is one shared slot and each player's Next
+  // queue is visible to their partner, or both stay fully private per
+  // player (the default).
+  setSharedNextHold: (shared: boolean) => void;
   // Host-only removal — informational room-size cap doesn't reject joins on
   // its own (see useOnlineRoom), so this is the actual enforcement tool.
   sendKick: (guestId: string) => void;
@@ -60,6 +69,10 @@ interface OnlineLobbyProps {
   // the choose screen (teardown already dropped roomCode back to null by
   // the time this renders).
   wasKicked: boolean;
+  // True right after a join attempt gets rejected for being over the host's
+  // room-size cap — same "shown once on the choose screen" handling as
+  // wasKicked above.
+  roomFull: boolean;
   // Room-scoped preset chat (see QUICK_CHAT_MESSAGES in useOnlineRoom) —
   // only shown once actually in a room, there's no one to talk to before that.
   quickChatLog: QuickChatEntry[];
@@ -166,10 +179,10 @@ const QUICK_CHAT_BUTTON_STYLE: React.CSSProperties = {
 export default function OnlineLobby({
   onStart, onCancel, initialCode,
   roomCode, isHost, opponents, selfReady, readyGuestIds, startAt,
-  createRoom, joinRoom, sendReady, leaveRoom,
+  createRoom, joinRoom, sendReady, sendUnready, leaveRoom,
   quickplayStatus, onQuickplaySearch, onQuickplayCancel,
   winCount,
-  nickname, setNickname, hostGuestId, roomSettings, setMaxPlayers, setStartingLevel, setLives, sendKick, wasKicked,
+  nickname, setNickname, hostGuestId, roomSettings, setMaxPlayers, setStartingLevel, setLives, setGameMode, setSharedNextHold, sendKick, wasKicked, roomFull,
   quickChatLog, sendQuickChat,
 }: OnlineLobbyProps) {
   const [entryMode, setEntryMode] = useState<'choose' | 'joining'>('choose');
@@ -219,13 +232,13 @@ export default function OnlineLobby({
     onCancel();
   };
 
-  // A kick can land while entryMode is still 'joining' (e.g. the removed
-  // player had the room-code screen open at the time) — without this, the
-  // wasKicked notice below would be unreachable, since 'joining' is a
-  // different branch than the one it's shown in.
+  // A kick (or a rejected over-capacity join) can land while entryMode is
+  // still 'joining' (e.g. the removed player had the room-code screen open
+  // at the time) — without this, the notice below would be unreachable,
+  // since 'joining' is a different branch than the one it's shown in.
   useEffect(() => {
-    if (wasKicked) setEntryMode('choose');
-  }, [wasKicked]);
+    if (wasKicked || roomFull) setEntryMode('choose');
+  }, [wasKicked, roomFull]);
 
   return (
     // width:100% + alignItems:'stretch' matter here, not just centering:
@@ -277,10 +290,16 @@ export default function OnlineLobby({
             ) : (
               quickChatLog.map((entry) => (
                 <p key={entry.id} style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.8)', margin: 0, lineHeight: 1.4, wordBreak: 'break-word' }}>
-                  <span style={{ color: 'var(--tt-accent)', fontWeight: 'bold' }}>
-                    {entry.nickname || entry.guestId.slice(0, 4).toUpperCase()}:
-                  </span>{' '}
-                  {QUICK_CHAT_MESSAGES[entry.messageId]}
+                  {entry.systemText ? (
+                    <span style={{ color: 'rgba(255,255,255,0.45)', fontStyle: 'italic' }}>{entry.systemText}</span>
+                  ) : (
+                    <>
+                      <span style={{ color: 'var(--tt-accent)', fontWeight: 'bold' }}>
+                        {entry.nickname || entry.guestId.slice(0, 4).toUpperCase()}:
+                      </span>{' '}
+                      {QUICK_CHAT_MESSAGES[entry.messageId!]}
+                    </>
+                  )}
                 </p>
               ))
             )}
@@ -314,25 +333,31 @@ export default function OnlineLobby({
 
         {/* initialCode (from a shared join link) stays truthy for this
             component's whole lifetime — VersusApp only blanks it out while
-            actually in a room (roomCode truthy), so getting kicked drops
-            roomCode back to null and this condition would otherwise become
-            true again forever, stranding a link-joiner on "Joining room…"
-            with no buttons ever reachable (the choose screen below was
-            gated on !initialCode, which never becomes true for them). The
-            !wasKicked guard here, paired with the (!initialCode ||
-            wasKicked) guard below, is what actually gets them back to a
-            screen with buttons on it. */}
-        {!roomCode && initialCode && !wasKicked && (
+            actually in a room (roomCode truthy), so getting kicked (or
+            rejected for being over the room's cap) drops roomCode back to
+            null and this condition would otherwise become true again
+            forever, stranding a link-joiner on "Joining room…" with no
+            buttons ever reachable (the choose screen below was gated on
+            !initialCode, which never becomes true for them). The
+            !wasKicked/!roomFull guard here, paired with the (!initialCode
+            || wasKicked || roomFull) guard on the three branches below, is
+            what actually gets them back to a screen with buttons on it. */}
+        {!roomCode && initialCode && !wasKicked && !roomFull && (
           <p style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)', fontSize: '0.85rem', margin: 0 }}>
             Joining room {initialCode}…
           </p>
         )}
 
-        {!roomCode && (!initialCode || wasKicked) && entryMode === 'choose' && quickplayStatus === 'idle' && (
+        {!roomCode && (!initialCode || wasKicked || roomFull) && entryMode === 'choose' && quickplayStatus === 'idle' && (
           <>
             {wasKicked && (
               <p style={{ textAlign: 'center', color: '#f87171', fontSize: '0.75rem', margin: 0 }}>
                 You were removed from the room by the host.
+              </p>
+            )}
+            {roomFull && (
+              <p style={{ textAlign: 'center', color: '#f87171', fontSize: '0.75rem', margin: 0 }}>
+                That room is already full.
               </p>
             )}
             <button style={PRIMARY_BUTTON_STYLE} onClick={onQuickplaySearch}>Quick Play</button>
@@ -342,7 +367,7 @@ export default function OnlineLobby({
           </>
         )}
 
-        {!roomCode && (!initialCode || wasKicked) && quickplayStatus === 'searching' && (
+        {!roomCode && (!initialCode || wasKicked || roomFull) && quickplayStatus === 'searching' && (
           <>
             <p style={{ textAlign: 'center', color: 'rgba(255,255,255,0.7)', fontSize: '0.85rem', margin: 0 }}>
               Searching for an opponent…
@@ -351,7 +376,7 @@ export default function OnlineLobby({
           </>
         )}
 
-        {!roomCode && (!initialCode || wasKicked) && entryMode === 'joining' && (
+        {!roomCode && (!initialCode || wasKicked || roomFull) && entryMode === 'joining' && (
           <>
             <input
               autoFocus
@@ -415,17 +440,41 @@ export default function OnlineLobby({
                 : 'Waiting for opponents…'}
             </p>
 
-            {/* Room size is informational here, not a hard join gate (see
+            {/* Game Mode picks which ruleset the room runs — Versus (today's
+                last-player-standing match), Practice (Sandbox's ruleset,
+                shared room, no attacks/lives/elimination), or Co-op (exactly
+                two players sharing one board; see useOnlineRoom's GameMode
+                type). Placed first since it reframes what the rows below it
+                mean — Lives is hidden entirely outside Versus, since neither
+                Practice nor Co-op has an elimination to spend lives against.
+                Room size is informational here, not a hard join gate (see
                 useOnlineRoom) — kicking is the actual way to stay under it.
                 Starting level is real, though: it's what TetrisGame actually
-                starts the match at. Host edits both; everyone else just sees
-                the current values, since they're broadcast live via the
-                host's own presence. */}
+                starts the match at. Host edits all of these; everyone else
+                just sees the current values, since they're broadcast live
+                via the host's own presence. */}
             {!startAt && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)', borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '0.75rem' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span>Room Size</span>
+                  <span>Game Mode</span>
                   {isHost ? (
+                    <select value={roomSettings.gameMode} onChange={(e) => setGameMode(e.target.value as GameMode)} style={SETTING_SELECT_STYLE}>
+                      <option value="versus">Versus</option>
+                      <option value="practice">Practice</option>
+                      <option value="coop">Co-op</option>
+                    </select>
+                  ) : (
+                    <span style={{ color: 'white' }}>{roomSettings.gameMode === 'practice' ? 'Practice' : roomSettings.gameMode === 'coop' ? 'Co-op' : 'Versus'}</span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>Room Size</span>
+                  {/* Co-op's shared board only ever supports one partner
+                      (see useOnlineRoom's setGameMode), so the size is
+                      fixed rather than editable while it's selected. */}
+                  {roomSettings.gameMode === 'coop' ? (
+                    <span style={{ color: 'white' }}>2 players (Co-op)</span>
+                  ) : isHost ? (
                     <select value={roomSettings.maxPlayers} onChange={(e) => setMaxPlayers(Number(e.target.value))} style={SETTING_SELECT_STYLE}>
                       {Array.from({ length: MAX_ROOM_SIZE - 1 }, (_, i) => i + 2).map((n) => (
                         <option key={n} value={n}>{n} players</option>
@@ -447,29 +496,60 @@ export default function OnlineLobby({
                     <span style={{ color: 'white' }}>{roomSettings.startingLevel}</span>
                   )}
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span>Lives</span>
-                  {isHost ? (
-                    <select value={roomSettings.lives} onChange={(e) => setLives(Number(e.target.value))} style={SETTING_SELECT_STYLE}>
-                      {Array.from({ length: MAX_LIVES }, (_, i) => i + 1).map((n) => (
-                        <option key={n} value={n}>{n}</option>
-                      ))}
-                    </select>
-                  ) : (
-                    <span style={{ color: 'white' }}>{roomSettings.lives}</span>
-                  )}
-                </div>
+                {roomSettings.gameMode === 'versus' && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>Lives</span>
+                    {isHost ? (
+                      <select value={roomSettings.lives} onChange={(e) => setLives(Number(e.target.value))} style={SETTING_SELECT_STYLE}>
+                        {Array.from({ length: MAX_LIVES }, (_, i) => i + 1).map((n) => (
+                          <option key={n} value={n}>{n}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span style={{ color: 'white' }}>{roomSettings.lives}</span>
+                    )}
+                  </div>
+                )}
+                {/* Co-op only — off by default (Phase A behavior: fully
+                    private Next/Hold per player). On, Hold becomes one
+                    shared slot and each player's Next queue is visible to
+                    their partner (see TetrisGame.tsx's isCoop adopt effect
+                    and the Partner's Next preview). */}
+                {roomSettings.gameMode === 'coop' && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>Share Next/Hold</span>
+                    {isHost ? (
+                      <select value={roomSettings.sharedNextHold ? 'yes' : 'no'} onChange={(e) => setSharedNextHold(e.target.value === 'yes')} style={SETTING_SELECT_STYLE}>
+                        <option value="no">No</option>
+                        <option value="yes">Yes</option>
+                      </select>
+                    ) : (
+                      <span style={{ color: 'white' }}>{roomSettings.sharedNextHold ? 'Yes' : 'No'}</span>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
-            {opponents.length > 0 && !startAt && (
+            {/* Shown even when alone (previously gated on opponents.length
+                > 0, which hid a solo host's own name/ready row entirely) —
+                there's still no way to actually start with nobody else
+                here (allReady requires opponents.length > 0, see
+                useOnlineRoom), so Ready is harmless to show; it just sits
+                ready-but-waiting until someone joins. Stays a live toggle
+                (not disabled) once ready, so a misclick — or just changing
+                your mind — can back out before the match starts; the host's
+                start-decision effect only fires while every opponent's
+                readyGuestIds entry AND this client's own selfReady are true
+                at the same time, so unreadying genuinely holds the room
+                open rather than just relabeling the button. */}
+            {!startAt && (
               <>
                 <button
-                  style={{ ...PRIMARY_BUTTON_STYLE, opacity: selfReady ? 0.6 : 1 }}
-                  disabled={selfReady}
-                  onClick={sendReady}
+                  style={selfReady ? SECONDARY_BUTTON_STYLE : PRIMARY_BUTTON_STYLE}
+                  onClick={selfReady ? sendUnready : sendReady}
                 >
-                  {selfReady ? 'Waiting for others…' : 'Ready'}
+                  {selfReady ? 'Unready' : 'Ready'}
                 </button>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
