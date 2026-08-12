@@ -24,7 +24,13 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
   // but the last-player-standing win condition needs a denominator that can't
   // move under a running match. Re-snapshots naturally on every rematch too,
   // since onStart fires again each time.
-  const [matchOpponents, setMatchOpponents] = useState<{ guestId: string; nickname: string }[]>([]);
+  const [matchOpponents, setMatchOpponents] = useState<{ guestId: string; nickname: string; team?: number }[]>([]);
+  // Teams only — this client's own team, snapshotted alongside matchOpponents
+  // for the same reason (there's no UI to change it mid-match, but matching
+  // the "everything the match logic reads is locked in at start" convention
+  // the rest of this snapshot already follows is cheap and one less thing to
+  // reason about later).
+  const [matchSelfTeam, setMatchSelfTeam] = useState(1);
   // Session-scoped, not persisted — resets on a full leave (Quit) but
   // survives rematches, since staying in the same room is exactly when a
   // running count should keep counting.
@@ -43,11 +49,35 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
   const [hasQuit, setHasQuit] = useState(false);
 
   const handleAttack = useCallback((amount: number) => {
-    const alive = matchOpponents.filter((o) => !room.eliminatedGuestIds.has(o.guestId));
+    // Teams-coop: a team shares one board, so an attack has to reach EVERY
+    // member of the target team (not one random individual, the way Teams
+    // itself does below) — otherwise their shared board would desync the
+    // moment one teammate's pendingGarbageRef gets it and another's
+    // doesn't. Pick one random still-alive enemy team ("alive" = at least
+    // one member not yet eliminated — teams-coop's members converge to all-
+    // eliminated together once the shared board is truly out of lives, but
+    // not necessarily simultaneously, see TetrisGame.tsx's win-condition
+    // comment), then broadcast to every one of its members.
+    if (room.matchGameMode === 'teams-coop') {
+      const enemyTeams = Array.from(new Set(matchOpponents.filter((o) => o.team !== matchSelfTeam).map((o) => o.team ?? 1)));
+      const aliveEnemyTeams = enemyTeams.filter((t) =>
+        matchOpponents.some((o) => o.team === t && !room.eliminatedGuestIds.has(o.guestId))
+      );
+      if (aliveEnemyTeams.length === 0) return;
+      const targetTeam = aliveEnemyTeams[Math.floor(Math.random() * aliveEnemyTeams.length)];
+      matchOpponents.filter((o) => o.team === targetTeam).forEach((o) => room.sendGarbage(amount, o.guestId));
+      return;
+    }
+
+    // Teams: never a teammate — only players on a different team than this
+    // client's own (matchSelfTeam) are ever valid targets. Versus/Practice
+    // (team field never set) fall through unfiltered exactly as before.
+    const eligible = matchOpponents.filter((o) => room.matchGameMode !== 'teams' || o.team !== matchSelfTeam);
+    const alive = eligible.filter((o) => !room.eliminatedGuestIds.has(o.guestId));
     if (alive.length === 0) return;
     const target = alive[Math.floor(Math.random() * alive.length)];
     room.sendGarbage(amount, target.guestId);
-  }, [matchOpponents, room.eliminatedGuestIds, room.sendGarbage]);
+  }, [matchOpponents, matchSelfTeam, room.matchGameMode, room.eliminatedGuestIds, room.sendGarbage]);
 
   // Once quickplay groups strangers onto a room code, hand off into the
   // same room flow a manual Create/Join uses — quickplay's only job was
@@ -67,7 +97,7 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           // component's whole lifetime, so this also prevents a rematch's
           // repeated OnlineLobby mounts from re-triggering a join.
           initialCode={hasQuit ? undefined : (room.roomCode ? undefined : initialRoomCode)}
-          onStart={() => { setMatchOpponents(room.opponents); setView('PLAYING'); }}
+          onStart={() => { setMatchOpponents(room.opponents); setMatchSelfTeam(room.team); setView('PLAYING'); }}
           onCancel={() => router.push('/')}
           roomCode={room.roomCode}
           isHost={room.isHost}
@@ -93,11 +123,15 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           setLives={room.setLives}
           setGameMode={room.setGameMode}
           setSharedNextHold={room.setSharedNextHold}
+          setTeamCount={room.setTeamCount}
+          team={room.team}
+          setTeam={room.setTeam}
           sendKick={room.sendKick}
           wasKicked={room.wasKicked}
           roomFull={room.roomFull}
           quickChatLog={room.quickChatLog}
           sendQuickChat={room.sendQuickChat}
+          teamsConflict={room.teamsConflict}
         />
       )}
 
@@ -113,7 +147,7 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           a no-op, in case a future path ever does reach it. */}
       {view === 'PLAYING' && (
         <TetrisGame
-          mode={room.matchGameMode === 'practice' ? 'practice' : room.matchGameMode === 'coop' ? 'coop' : 'versus'}
+          mode={room.matchGameMode === 'practice' ? 'practice' : room.matchGameMode === 'coop' ? 'coop' : room.matchGameMode === 'teams' ? 'teams' : room.matchGameMode === 'teams-coop' ? 'teams-coop' : 'versus'}
           onMenu={() => { room.leaveRoom(); setWinCount(0); setHasQuit(true); setView('LOBBY'); }}
           onRematchMenu={() => { room.resetMatchReady(); setView('LOBBY'); }}
           onAttack={handleAttack}
@@ -122,6 +156,13 @@ export default function VersusApp({ initialRoomCode }: VersusAppProps) {
           eliminatedOpponentIds={Array.from(room.eliminatedGuestIds)}
           opponentIds={matchOpponents.map((o) => o.guestId)}
           opponentNicknames={Object.fromEntries(matchOpponents.map((o) => [o.guestId, o.nickname]))}
+          // Both team modes — the win-condition effect watches this (not
+          // opponentIds, which stays "everyone else" so the preview column
+          // can still show teammates) for "has every enemy been eliminated."
+          // opponentTeams feeds the preview column's own team grouping.
+          enemyIds={(room.matchGameMode === 'teams' || room.matchGameMode === 'teams-coop') ? matchOpponents.filter((o) => o.team !== matchSelfTeam).map((o) => o.guestId) : undefined}
+          opponentTeams={(room.matchGameMode === 'teams' || room.matchGameMode === 'teams-coop') ? Object.fromEntries(matchOpponents.map((o) => [o.guestId, o.team ?? 1])) : undefined}
+          selfTeam={(room.matchGameMode === 'teams' || room.matchGameMode === 'teams-coop') ? matchSelfTeam : undefined}
           seed={room.matchSeed ?? undefined}
           startingLevel={room.matchStartingLevel ?? undefined}
           lives={room.matchLives ?? undefined}

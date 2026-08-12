@@ -19,12 +19,20 @@ interface BoardSnapshot {
   lines: number;
   next: number[];
   hold: number | null;
-  // Co-op only, present only on an actual lock broadcast — see the
-  // isCoop lock-delta effect for why board sync is merge-only, not a
-  // wholesale `board` replace.
+  // Co-op / teams-coop only, present only on an actual lock broadcast —
+  // see the isCoop/isTeamsCoop adopt-effect for why board sync is
+  // merge-only, not a wholesale `board` replace.
   lockedPieceMatrix?: number[][];
   lockedPieceX?: number;
   lockedPieceY?: number;
+  // Teams-coop only, present only on the lock broadcast where this client
+  // actually applied incoming garbage — see insertGarbageRows and the
+  // adopt-effect's replay-not-reroll handling.
+  insertedGarbageCount?: number;
+  insertedGarbageGapCol?: number;
+  // Teams-coop only, present only on the broadcast fired at the exact
+  // moment this client soft-reset after topping out with team lives left.
+  sharedBoardCleared?: boolean;
 }
 
 interface TetrisGameProps {
@@ -54,6 +62,20 @@ interface TetrisGameProps {
   // bigger lobby's players each place their first piece instead of all
   // being visible (empty) immediately.
   opponentIds?: string[];
+  // Teams mode only. The win-condition check needs "every player on every
+  // *other* team," not "every other player" — opponentIds stays the latter
+  // (so the preview column can still show teammates), and this narrower
+  // roster is what the win-check effect actually watches when present,
+  // falling back to opponentIds when it's not (every other mode). See
+  // VersusApp's matchOpponents/matchSelfTeam for how this is derived.
+  enemyIds?: string[];
+  // Teams mode only — guestId -> team number, from the same match-start
+  // roster snapshot opponentIds/opponentNicknames come from. Drives the
+  // preview column's team-grouped layout below.
+  opponentTeams?: Record<string, number>;
+  // Teams mode only — this client's own team, so the preview column can
+  // label its own team's group distinctly ("Your Team") from the others.
+  selfTeam?: number;
   // Keeps the room alive and returns to the lobby's ready-up screen, unlike
   // onMenu (full leave) — used by the post-match "Rematch" button, and also
   // by a passed mid-match quit vote (see quitVotes below), since both mean
@@ -109,6 +131,17 @@ interface TetrisGameProps {
   // Next queue is shown to their partner as a read-only preview. Defaults
   // to false/unset, matching Phase A's behavior exactly.
   sharedNextHold?: boolean;
+  // Opt-in ruleset toggle, independent of `mode` — when true, gravity is
+  // driven by elapsed match time instead of this player's own line clears
+  // (ramping linearly up to ARENA_GRAVITY_MAX_LEVEL over ARENA_GRAVITY_RAMP_MS,
+  // see the update() loop), and past that ramp, unclearable "sudden death"
+  // rows rise from the bottom on a fixed schedule (see insertUnclearableRow)
+  // to guarantee a match ends within bounded time regardless of how well
+  // anyone plays. Built as a standalone prop rather than a `mode === 'arena'`
+  // check specifically so any future mode can opt in the same way Arena does
+  // (see ArenaApp.tsx) without touching this mechanism at all. Off by
+  // default — every existing mode keeps its current per-line-clear leveling.
+  timeBasedGravity?: boolean;
 }
 
 interface ScoreEntry {
@@ -234,7 +267,18 @@ const collide = (boardMatrix: number[][], playerPiece: { matrix: number[][], pos
 const merge = (boardMatrix: number[][], playerPiece: { matrix: number[][], pos: { x: number, y: number } }) => {
   playerPiece.matrix.forEach((row, y) => {
     row.forEach((value, x) => {
-      if (value !== 0) boardMatrix[y + playerPiece.pos.y][x + playerPiece.pos.x] = value;
+      if (value === 0) return;
+      // Bounds-checked: normally guaranteed in-range for the local player's
+      // own lock (collide() already validated pos against this exact
+      // board), but teams-coop's adopt-effect replays a teammate's
+      // lockedPieceMatrix/pos onto THIS client's own board copy, which can
+      // momentarily be a slightly different shape/alignment than the
+      // sender's (broadcast ordering isn't guaranteed) — same "accepted
+      // small race, self-corrects on the next exchange" tradeoff already
+      // made elsewhere in this file, just needs to not crash the tab.
+      const targetRow = boardMatrix[y + playerPiece.pos.y];
+      if (!targetRow || x + playerPiece.pos.x < 0 || x + playerPiece.pos.x >= targetRow.length) return;
+      targetRow[x + playerPiece.pos.x] = value;
     });
   });
 };
@@ -251,7 +295,11 @@ const sweepLines = (boardMatrix: number[][]): number => {
   let linesCleared = 0;
   outer: for (let y = boardMatrix.length - 1; y >= 0; --y) {
     for (let x = 0; x < boardMatrix[y].length; ++x) {
-      if (boardMatrix[y][x] === 0) continue outer;
+      // A row containing an unclearable (sudden-death) cell is never treated
+      // as complete, full or not — see UNCLEARABLE_GARBAGE_VALUE/
+      // insertUnclearableRow below. Only the timeBasedGravity ruleset ever
+      // writes that value, so this check is a no-op for every other mode.
+      if (boardMatrix[y][x] === 0 || boardMatrix[y][x] === UNCLEARABLE_GARBAGE_VALUE) continue outer;
     }
     const row = boardMatrix.splice(y, 1)[0].fill(0);
     boardMatrix.unshift(row);
@@ -271,14 +319,42 @@ const getBaseAttack = (linesCleared: number, tSpin: boolean): number => {
   return linesCleared === 2 ? 1 : linesCleared === 3 ? 2 : linesCleared === 4 ? 4 : 0;
 };
 
-const insertGarbageRows = (boardMatrix: number[][], count: number) => {
-  const gapCol = Math.floor(Math.random() * COLS);
+// Teams-coop only: `gapCol` can be pre-chosen (a replay of another
+// teammate's already-broadcast insertion) instead of freshly randomized —
+// see the isCoop/isTeamsCoop adopt-effect for why a shared board can't have
+// every teammate roll their own random gap independently. Returns whichever
+// gapCol it actually used, so the caller can broadcast it for teammates to
+// replay verbatim. Versus/Teams (one board per player, no replay needed)
+// just don't pass or read the third argument/return value.
+const insertGarbageRows = (boardMatrix: number[][], count: number, gapCol: number = Math.floor(Math.random() * COLS)) => {
   for (let i = 0; i < count; i++) {
     boardMatrix.shift();
     const row = new Array(COLS).fill(GARBAGE_VALUE);
     row[gapCol] = 0;
     boardMatrix.push(row);
   }
+  return gapCol;
+};
+
+// timeBasedGravity only — see TetrisGameProps' own comment. Gravity ramps
+// linearly from level 1 to ARENA_GRAVITY_MAX_LEVEL over ARENA_GRAVITY_RAMP_MS
+// of elapsed match time (not lines cleared), and once that ramp completes,
+// one fully-solid, unclearable row (see insertUnclearableRow/sweepLines)
+// rises from the bottom every ARENA_SUDDEN_DEATH_ROW_INTERVAL_MS — both
+// driven straight off elapsedTimeRef in the update() game loop. Tunable:
+// these three numbers are the entire pacing knob for how long a match can
+// run before it's forced to a close.
+const ARENA_GRAVITY_MAX_LEVEL = 10;
+const ARENA_GRAVITY_RAMP_MS = 3 * 60 * 1000;
+const ARENA_SUDDEN_DEATH_ROW_INTERVAL_MS = 3500;
+const UNCLEARABLE_GARBAGE_VALUE = 9;
+
+// No gap column, unlike insertGarbageRows — a solid rising floor is the
+// whole point (nothing to dig through, just less time before it reaches
+// you), matching how this mechanic looks in every real implementation of it.
+const insertUnclearableRow = (boardMatrix: number[][]) => {
+  boardMatrix.shift();
+  boardMatrix.push(new Array(COLS).fill(UNCLEARABLE_GARBAGE_VALUE));
 };
 
 const rotate = (matrix: number[][], dir: number) => {
@@ -431,7 +507,7 @@ const TouchControlButton = ({
 // 2. MAIN REACT COMPONENT
 // ==========================================
 
-export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, onEliminated, eliminatedOpponentIds, opponentIds, onRematchMenu, seed, startingLevel, lives, onBoardUpdate, opponentBoards, opponentNicknames, onMatchWin, quitVotes, selfQuitVote, quitVoteDeadline, onQuitVote, onRetractQuitVote, sharedNextHold }: TetrisGameProps) {
+export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, onEliminated, eliminatedOpponentIds, opponentIds, enemyIds, opponentTeams, selfTeam, onRematchMenu, seed, startingLevel, lives, onBoardUpdate, opponentBoards, opponentNicknames, onMatchWin, quitVotes, selfQuitVote, quitVoteDeadline, onQuitVote, onRetractQuitVote, sharedNextHold, timeBasedGravity }: TetrisGameProps) {
   // 'practice' = Sandbox's single-player ruleset (adjustable gravity, spawn
   // hotkeys, clear-on-topout, no leaderboard) running inside the same
   // multiplayer room/preview plumbing 'versus' uses, minus the competitive
@@ -442,7 +518,18 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // (co-op, powerups) should extend these two groupings rather than adding
   // scattered mode checks.
   const isSandboxRules = mode === 'standard' || mode === 'practice';
-  const isMultiplayerRoom = mode === 'versus' || mode === 'practice';
+  // 'teams' shares versus's room/preview plumbing (broadcast cadence,
+  // preview column, quit-vote UI) wholesale — it's competitive like versus,
+  // just with garbage/win-condition scoped to enemy teams (see isTeams,
+  // enemyIds) rather than every opponent. Folded into this grouping rather
+  // than kept separate, unlike isCoop below, since none of isMultiplayerRoom's
+  // use sites need to tell versus and teams apart.
+  const isMultiplayerRoom = mode === 'versus' || mode === 'practice' || mode === 'teams';
+  // Competitive-mechanics gate (attacks/lives/elimination/seeded RNG/no-
+  // pause) — versus and teams share every one of these verbatim; only the
+  // *targeting* (handleAttack, VersusApp) and *win-condition roster*
+  // (enemyIds vs opponentIds, below) actually differ between them.
+  const isTeams = mode === 'teams';
   // 'coop' = exactly two players sharing one board, each controlling their
   // own independently-falling piece — gravity climbs like versus (not
   // sandbox-rules), and the partner is overlaid directly on this client's
@@ -451,6 +538,27 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // (isMultiplayerRoom's other use sites — the 1-on-1/compact preview
   // column — should NOT pick coop up).
   const isCoop = mode === 'coop';
+  // 'teams-coop' = the same team structure as 'teams' (targeting/win-
+  // condition/enemyIds all identical, see isTeams's own comment above) —
+  // except each *team* shares one board the way coop's two players do.
+  // Generalizes isCoop's merge-only sync from exactly one partner to
+  // however many share a team (see the adopt-effect below), and kept
+  // separate from isMultiplayerRoom for the exact same reason isCoop is:
+  // teammates are overlaid directly on this client's own canvas, not shown
+  // as side preview boards, so isMultiplayerRoom's other use sites (the
+  // 1-on-1/compact preview column) should NOT pick this up either — every
+  // site that already reads `isMultiplayerRoom || isCoop` for board-sync/
+  // broadcast plumbing gets `|| isTeamsCoop` alongside it instead.
+  const isTeamsCoop = mode === 'teams-coop';
+  // 'arena' = the auto-join public battle royale (see useArena.ts/
+  // ArenaApp.tsx) — mechanically identical to versus's competitive rules
+  // (attacks/lives/elimination/seeded RNG/no-pause/HUD), so it's folded into
+  // every `mode === 'versus' || isTeams || isTeamsCoop` check the same way
+  // Teams and Teams Co-op each were. Deliberately NOT folded into
+  // isMultiplayerRoom's quit-vote use sites, though — arena's roster can be
+  // up to 100 players with no fixed small room to negotiate a vote among, so
+  // Quit there stays a unilateral leave (same as solo modes), not a vote.
+  const isArena = mode === 'arena';
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timeDisplayRef = useRef<HTMLParagraphElement>(null);
   const requestRef = useRef<number>(0);
@@ -478,14 +586,14 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   const comboRef = useRef(-1);
   const actionTextRef = useRef({ text: '', timer: 0 });
 
-  // Seeded in versus (both players' bags are identical, useful for a fair
-  // race) and now also in co-op (per direct request: "ensure they are
+  // Seeded in versus and teams (every player's bags are identical, useful
+  // for a fair race) and in co-op (per direct request: "ensure they are
   // taking blocks from the same bag" when Share Next/Hold is on — each
   // player still advances their own queue independently as they lock, but
   // starting from the same seed means both bags are the same underlying
   // sequence rather than two unrelated random streams). Solo modes and
   // practice fall through to Math.random.
-  const rngRef = useRef<() => number>((mode === 'versus' || mode === 'coop') && seed != null ? mulberry32(seed) : Math.random);
+  const rngRef = useRef<() => number>((mode === 'versus' || isTeams || isTeamsCoop || isArena || mode === 'coop') && seed != null ? mulberry32(seed) : Math.random);
   const nextPiecesRef = useRef<number[]>([...generateBag(rngRef.current), ...generateBag(rngRef.current)]);
   const holdPieceRef = useRef<number | null>(null);
   const canHoldRef = useRef(true);
@@ -564,31 +672,59 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // Throttles the live-position broadcast added to the game loop below —
   // see PREVIEW_BROADCAST_INTERVAL_MS.
   const lastPreviewBroadcastRef = useRef(0);
+  // timeBasedGravity only — how many sudden-death rows have been inserted
+  // so far this match, compared each frame against how many SHOULD have
+  // been inserted by now given elapsed time (see the update() loop) so a
+  // missed frame or two never permanently loses a row.
+  const suddenDeathRowsInsertedRef = useRef(0);
 
   // Incoming garbage just accumulates here — it's netted against this
   // client's own attack and actually inserted into the board on the next
   // piece lock (see lockPiece), not on arrival.
   useEffect(() => {
-    if (mode !== 'versus' || !incomingGarbage) return;
+    if (!(mode === 'versus' || isTeams || isTeamsCoop || isArena) || !incomingGarbage) return;
     pendingGarbageRef.current += incomingGarbage.amount;
     setPendingGarbageDisplay(pendingGarbageRef.current);
-  }, [mode, incomingGarbage]);
+  }, [mode, isTeams, isTeamsCoop, isArena, incomingGarbage]);
 
-  // Last-player-standing: once every opponent in the starting roster has
-  // broadcast their own elimination, this client has outlasted the room —
-  // independent of anything happening locally, hence matchEndedRef to stop
-  // this double-firing against a local handleGameOver call already in flight.
+  // Last-player-standing (versus) / last-team-standing (teams): once every
+  // id in the watched roster has broadcast its own elimination, this client
+  // has outlasted the room — independent of anything happening locally,
+  // hence matchEndedRef to stop this double-firing against a local
+  // handleGameOver call already in flight. The watched roster is enemyIds
+  // when present (teams — only the opposing team's players need to be
+  // gone) and falls back to opponentIds otherwise (versus — everyone else),
+  // so this is the exact same check either way, just given a different
+  // roster; see enemyIds' own comment on TetrisGameProps for why that's a
+  // separate prop from opponentIds rather than opponentIds meaning
+  // different things in different modes.
   useEffect(() => {
-    if (mode !== 'versus' || matchEndedRef.current) return;
-    if (!opponentIds || opponentIds.length === 0) return;
-    if (!opponentIds.every((id) => eliminatedOpponentIds?.includes(id))) return;
+    if (!(mode === 'versus' || isTeams || isTeamsCoop || isArena) || matchEndedRef.current) return;
+    const roster = enemyIds ?? opponentIds;
+    if (!roster || roster.length === 0) return;
+    if (!roster.every((id) => eliminatedOpponentIds?.includes(id))) return;
     matchEndedRef.current = true;
     scoreRef.current = elapsedTimeRef.current;
     setVersusOutcome('won-last-standing');
     setGameState('LEADERBOARD');
     onMatchWin?.();
     syncUi();
-  }, [mode, eliminatedOpponentIds, opponentIds]);
+  }, [mode, isTeams, isTeamsCoop, isArena, eliminatedOpponentIds, opponentIds, enemyIds]);
+
+  // Arena only: rather than a manual Rematch click, a finished round result
+  // clears itself after a short beat and this client rejoins the waiting
+  // pool for whichever round gets proposed next (see useArena's
+  // returnToWaiting) — matches the "continuously running" feel the mode is
+  // going for. The Rematch button (relabeled "Back to Queue" for arena, see
+  // the result overlay below) still works too, for anyone who doesn't want
+  // to wait out the delay.
+  const arenaAutoReturnedRef = useRef(false);
+  useEffect(() => {
+    if (!isArena || gameState !== 'LEADERBOARD' || arenaAutoReturnedRef.current) return;
+    arenaAutoReturnedRef.current = true;
+    const timeout = setTimeout(() => onRematchMenu?.(), 4000);
+    return () => clearTimeout(timeout);
+  }, [isArena, gameState, onRematchMenu]);
 
   // Co-op: a shared loss, not a win/lose split — the moment the partner's
   // id shows up in eliminatedOpponentIds (whether they topped out or
@@ -617,75 +753,122 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // Rematch button both mean.
   const quitVotePassedRef = useRef(false);
   useEffect(() => {
-    if (!(isMultiplayerRoom || isCoop) || matchEndedRef.current || quitVotePassedRef.current) return;
+    if (!(isMultiplayerRoom || isCoop || isTeamsCoop) || matchEndedRef.current || quitVotePassedRef.current) return;
     if (!opponentIds || opponentIds.length === 0 || !selfQuitVote) return;
     const activeRoster = opponentIds.filter((id) => !eliminatedOpponentIds?.includes(id));
     if (!activeRoster.every((id) => quitVotes?.has(id))) return;
     quitVotePassedRef.current = true;
     onRematchMenu?.();
-  }, [isMultiplayerRoom, isCoop, selfQuitVote, quitVotes, opponentIds, eliminatedOpponentIds]);
+  }, [isMultiplayerRoom, isCoop, isTeamsCoop, selfQuitVote, quitVotes, opponentIds, eliminatedOpponentIds]);
 
-  // Co-op: merge-only board sync, NOT a wholesale replace. An earlier
-  // version of this effect did `board.current = partner.board` on every
-  // broadcast (including the periodic ~200ms position tick) — since that
-  // fires roughly 5x/second in each direction regardless of whether either
-  // side actually locked anything new, any time a partner's broadcast
-  // happened to be even slightly behind this client's own most recent lock
-  // when it arrived, that lock would get silently erased. Not a rare
-  // simultaneous-lock edge case — a near-constant race under normal play,
-  // which is what was actually behind pieces intermittently vanishing
-  // (and the resulting board flicker reading as "lag").
+  // Co-op / Teams-coop: merge-only board sync, NOT a wholesale replace. An
+  // earlier version of this effect did `board.current = partner.board` on
+  // every broadcast (including the periodic ~200ms position tick) — since
+  // that fires roughly 5x/second in each direction regardless of whether
+  // either side actually locked anything new, any time a partner's
+  // broadcast happened to be even slightly behind this client's own most
+  // recent lock when it arrived, that lock would get silently erased. Not
+  // a rare simultaneous-lock edge case — a near-constant race under normal
+  // play, which is what was actually behind pieces intermittently
+  // vanishing (and the resulting board flicker reading as "lag").
   //
   // Fix: only mutate board.current when this specific broadcast is an
   // actual lock (lockedPieceMatrix present — see BoardSnapshot/lockPiece),
   // and even then only ever ADD cells via the same merge()+sweepLines()
   // lockPiece already uses locally, never replace the array wholesale.
-  // Merging is commutative — applying this client's own locks and the
-  // partner's, in any arrival order, converges to the same board shape —
-  // so a stale-relative-to-something-else broadcast can no longer erase
-  // progress the sender didn't know about yet.
+  // Merging is commutative — applying this client's own locks and any
+  // number of teammates', in any arrival order, converges to the same
+  // board shape — so a stale-relative-to-something-else broadcast can no
+  // longer erase progress the sender didn't know about yet.
+  //
+  // Co-op is always exactly one partner (opponentBoards[0]); teams-coop
+  // generalizes this to however many share the team (every same-team entry
+  // in opponentBoards) — everything below is a straight loop over
+  // `partners` instead of one fixed variable, plus two teams-coop-only
+  // branches (garbage-insertion replay, team-lives min-merge) that coop
+  // never triggers since neither field is ever populated for it.
   useEffect(() => {
-    if (!isCoop) return;
-    const partner = opponentBoards?.[0];
-    if (!partner) return;
-    if (partner.lockedPieceMatrix) {
-      merge(board.current, { matrix: partner.lockedPieceMatrix, pos: { x: partner.lockedPieceX ?? 0, y: partner.lockedPieceY ?? 0 } });
-      sweepLines(board.current);
-    }
-    // Monotonic values — Math.max rather than adopt-verbatim, for the same
-    // "never regress from a momentarily-behind broadcast" reason as board
-    // above. Safe to run on every broadcast (periodic ticks included),
-    // not just lock ones — idempotent when nothing's actually higher yet.
-    scoreRef.current = Math.max(scoreRef.current, partner.score);
-    linesRef.current = Math.max(linesRef.current, partner.lines);
-    // Gravity speed has to stay in lockstep with the shared level, not just
-    // its displayed number — otherwise a client whose partner is further
-    // ahead would show the higher level but keep falling at their own
-    // stale, slower speed.
-    if (partner.level > levelRef.current) {
-      levelRef.current = partner.level;
-      dropInterval.current = calculateDropInterval(levelRef.current);
-    }
-    // Hold is a genuinely shared slot when sharedNextHold is on — not just
-    // visible to the partner but a single resource either player can swap
-    // into (see holdPiece). Still adopt-verbatim (not max-mergeable — a
-    // piece type isn't a monotonic quantity), so the existing Hold box
-    // (uiState.hold, driven by this same holdPieceRef via syncUi) already
-    // renders it correctly with no new UI. This one's race window is much
-    // narrower than the board's was: hold changes are a discrete action a
-    // few times a minute, not a continuous ~5Hz sync target, and wasn't
-    // what was reported as broken — left as-is rather than over-fixing
-    // something that isn't the problem. Off (default), hold stays
-    // untouched here — fully private per player, matching Phase A. Next is
-    // never adopted into gameplay state either way — each player's own
-    // queue stays their own; sharing it is display-only (see the Partner's
-    // Next preview, reading opponentBoards directly rather than through
-    // this ref-mutation path).
-    if (sharedNextHold) {
-      holdPieceRef.current = partner.hold;
+    if (!isCoop && !isTeamsCoop) return;
+    const partners = isTeamsCoop
+      ? (opponentBoards?.filter((o) => (opponentTeams?.[o.guestId] ?? 1) === selfTeam) ?? [])
+      : (opponentBoards?.[0] ? [opponentBoards[0]] : []);
+    if (partners.length === 0) return;
+    for (const partner of partners) {
+      if (partner.lockedPieceMatrix) {
+        merge(board.current, { matrix: partner.lockedPieceMatrix, pos: { x: partner.lockedPieceX ?? 0, y: partner.lockedPieceY ?? 0 } });
+        sweepLines(board.current);
+      }
+      // Monotonic values — Math.max rather than adopt-verbatim, for the same
+      // "never regress from a momentarily-behind broadcast" reason as board
+      // above. Safe to run on every broadcast (periodic ticks included),
+      // not just lock ones — idempotent when nothing's actually higher yet.
+      scoreRef.current = Math.max(scoreRef.current, partner.score);
+      linesRef.current = Math.max(linesRef.current, partner.lines);
+      // Gravity speed has to stay in lockstep with the shared level, not just
+      // its displayed number — otherwise a client whose partner is further
+      // ahead would show the higher level but keep falling at their own
+      // stale, slower speed.
+      if (partner.level > levelRef.current) {
+        levelRef.current = partner.level;
+        dropInterval.current = calculateDropInterval(levelRef.current);
+      }
+      // Hold is a genuinely shared slot when sharedNextHold is on — not just
+      // visible to the partner but a single resource either player can swap
+      // into (see holdPiece). Still adopt-verbatim (not max-mergeable — a
+      // piece type isn't a monotonic quantity), so the existing Hold box
+      // (uiState.hold, driven by this same holdPieceRef via syncUi) already
+      // renders it correctly with no new UI. Coop only — teams-coop doesn't
+      // offer Share Next/Hold (a shared slot among 3-4 people is a bigger,
+      // separate ask than what was asked for here), so `sharedNextHold` is
+      // never true there and this simply never fires for it. Off (default),
+      // hold stays untouched here — fully private per player, matching
+      // Phase A. Next is never adopted into gameplay state either way —
+      // each player's own queue stays their own; sharing it is display-only
+      // (see the Partner's Next preview, reading opponentBoards directly
+      // rather than through this ref-mutation path).
+      if (isCoop && sharedNextHold) {
+        holdPieceRef.current = partner.hold;
+      }
+      // Teams-coop only, from here down — coop's BoardSnapshot never
+      // populates insertedGarbageCount/sharedBoardCleared (they're only
+      // ever set in the mode === 'versus' || isTeams || isTeamsCoop
+      // branches of lockPiece/handleGameOver), so these are no-ops for coop.
+      if (isTeamsCoop) {
+        // A shared board can't have every teammate independently roll their
+        // own random gap column for incoming garbage (they'd diverge
+        // immediately — see insertGarbageRows' own comment) — whichever
+        // teammate's lock actually applied it broadcasts the exact
+        // operation here, and every other teammate replays it verbatim
+        // (never rerolls) and clears their own pending debt, since the
+        // team's incoming garbage was just collectively paid.
+        if (partner.insertedGarbageCount != null && partner.insertedGarbageGapCol != null) {
+          insertGarbageRows(board.current, partner.insertedGarbageCount, partner.insertedGarbageGapCol);
+          pendingGarbageRef.current = 0;
+          setPendingGarbageDisplay(0);
+        }
+        // Team lives only ever go down — Math.min rather than adopt-
+        // verbatim, so a client that hasn't yet locally detected the
+        // topout itself still immediately reflects a teammate's broadcast
+        // of the lower count, same reasoning as score/lines' Math.max above
+        // just in the other direction.
+        if (partner.livesRemaining < livesRemainingRef.current) {
+          livesRemainingRef.current = partner.livesRemaining;
+          setLivesDisplay(livesRemainingRef.current);
+        }
+        // Merge-only sync has no way to represent "wipe the board," only
+        // "add these cells" — a teammate's soft-reset-with-lives-left (see
+        // handleGameOver) needs this explicit instruction so every other
+        // teammate's local board copy actually clears too, not just the
+        // one client that topped out.
+        if (partner.sharedBoardCleared) {
+          board.current = createMatrix(COLS, ROWS);
+          comboRef.current = -1;
+          b2bRef.current = false;
+        }
+      }
     }
     syncUi();
-  }, [isCoop, opponentBoards, sharedNextHold]);
+  }, [isCoop, isTeamsCoop, opponentBoards, opponentTeams, selfTeam, sharedNextHold]);
 
   // Live countdown for the Left Panel's vote banner — ticks locally off the
   // shared quitVoteDeadline timestamp, same "every client ticks its own
@@ -818,11 +1001,11 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   };
 
   useEffect(() => {
-    // Sandbox/Practice don't score or compete, and versus/coop matches
-    // aren't ranked against the solo leaderboard either — none of them have
-    // one to show or fetch.
-    if (!isSandboxRules && mode !== 'versus' && mode !== 'coop') fetchLeaderboard();
-  }, [mode, isSandboxRules]);
+    // Sandbox/Practice don't score or compete, and versus/coop/teams/
+    // teams-coop matches aren't ranked against the solo leaderboard either
+    // — none of them have one to show or fetch.
+    if (!isSandboxRules && mode !== 'versus' && mode !== 'coop' && !isTeams && !isTeamsCoop && !isArena) fetchLeaderboard();
+  }, [mode, isSandboxRules, isTeams, isTeamsCoop]);
 
   const saveHighScore = async () => {
     if (isSubmitting) return;
@@ -891,11 +1074,11 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       return;
     }
 
-    if (mode === 'versus') {
-      // Only ever reached via topout now — versus has no line-clear win
-      // path (see the removed SPRINT_GOAL check in lockPiece), so isWin is
-      // always false here; last-player-standing wins are decided separately
-      // by the eliminatedOpponentIds effect above instead.
+    if (mode === 'versus' || isTeams || isTeamsCoop || isArena) {
+      // Only ever reached via topout now — none of these have a line-clear
+      // win path (see the removed SPRINT_GOAL check in lockPiece), so isWin
+      // is always false here; last-player/team-standing wins are decided
+      // separately by the eliminatedOpponentIds effect above instead.
       if (matchEndedRef.current) return;
 
       if (livesRemainingRef.current > 1) {
@@ -903,7 +1086,13 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         // above, not a real elimination: the match clock, piece queue,
         // lines-sent/received totals, and win-condition eligibility all
         // keep running uninterrupted, only the board and combo/back-to-back
-        // state clear.
+        // state clear. Teams-coop: livesRemainingRef is the TEAM's shared
+        // count here (min-merged by the adopt-effect below, not tracked
+        // independently per player), so this decrement is immediately
+        // followed by a `sharedBoardCleared` broadcast — merge-only sync
+        // has no way to represent "wipe the board," only "add these cells,"
+        // so every teammate needs an explicit instruction to clear their
+        // own local copy too, not just the client that actually topped out.
         livesRemainingRef.current -= 1;
         setLivesDisplay(livesRemainingRef.current);
         board.current = createMatrix(COLS, ROWS);
@@ -923,7 +1112,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         {
           const nextMatrix = PIECES[nextPiecesRef.current[0]];
           const nextX = Math.floor(COLS / 2) - Math.floor(nextMatrix[0].length / 2);
-          onBoardUpdate?.({ board: board.current, pieceMatrix: nextMatrix, pieceX: nextX, pieceY: 0, livesRemaining: livesRemainingRef.current, score: scoreRef.current, level: levelRef.current, lines: linesRef.current, next: nextPiecesRef.current.slice(0, 5), hold: holdPieceRef.current });
+          onBoardUpdate?.({ board: board.current, pieceMatrix: nextMatrix, pieceX: nextX, pieceY: 0, livesRemaining: livesRemainingRef.current, score: scoreRef.current, level: levelRef.current, lines: linesRef.current, next: nextPiecesRef.current.slice(0, 5), hold: holdPieceRef.current, ...(isTeamsCoop ? { sharedBoardCleared: true } : {}) });
         }
         playerReset();
         syncUi();
@@ -1040,7 +1229,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
     const tSpin = isTSpin();
     const linesCleared = sweepLines(board.current);
 
-    let attack = mode === 'versus' ? getBaseAttack(linesCleared, tSpin) : 0;
+    let attack = (mode === 'versus' || isTeams || isTeamsCoop || isArena) ? getBaseAttack(linesCleared, tSpin) : 0;
 
     if (linesCleared > 0) {
       comboRef.current++;
@@ -1066,7 +1255,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         if (b2bRef.current) {
           calculatedScore = Math.floor(calculatedScore * 1.5);
           actionStr = 'B2B ' + actionStr;
-          if (mode === 'versus') attack += 1;
+          if (mode === 'versus' || isTeams || isTeamsCoop || isArena) attack += 1;
         }
         b2bRef.current = true;
       } else {
@@ -1076,7 +1265,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       if (comboRef.current > 0) {
         calculatedScore += 50 * comboRef.current * levelRef.current;
         actionStr += `\n${comboRef.current} Combo`;
-        if (mode === 'versus') attack += COMBO_ATTACK[Math.min(comboRef.current, COMBO_ATTACK.length - 1)];
+        if (mode === 'versus' || isTeams || isTeamsCoop || isArena) attack += COMBO_ATTACK[Math.min(comboRef.current, COMBO_ATTACK.length - 1)];
       }
 
       if (mode === 'blitz' || isSandboxRules || mode === 'coop') {
@@ -1089,8 +1278,10 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       // Offset from startingLevel (1 outside versus, or when the host left it
       // at the default) rather than reset to a flat +1, so a host-chosen
       // starting level keeps climbing from there instead of being clobbered
-      // by the first line clear.
-      if (!isSandboxRules) {
+      // by the first line clear. timeBasedGravity also excluded — its level
+      // moves only on the elapsed-time schedule in the update() loop, so
+      // this per-clear path would otherwise fight it.
+      if (!isSandboxRules && !timeBasedGravity) {
         levelRef.current = (startingLevel ?? 1) + Math.floor(linesRef.current / 10);
         dropInterval.current = calculateDropInterval(levelRef.current);
       }
@@ -1110,7 +1301,12 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       }
     }
 
-    if (mode === 'versus') {
+    // Teams-coop: captured only when this client's lock actually performs a
+    // real insertion, then threaded into the broadcast below so teammates
+    // replay the exact same operation instead of independently rolling
+    // their own random gap column (see insertGarbageRows' own comment).
+    let insertedGarbage: { count: number; gapCol: number } | undefined;
+    if (mode === 'versus' || isTeams || isTeamsCoop || isArena) {
       const cancelled = Math.min(attack, pendingGarbageRef.current);
       pendingGarbageRef.current -= cancelled;
       const netAttack = attack - cancelled;
@@ -1122,7 +1318,9 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         setAttackPerMin(min > 0 ? linesSentRef.current / min : 0);
       }
       if (pendingGarbageRef.current > 0) {
-        insertGarbageRows(board.current, pendingGarbageRef.current);
+        const count = pendingGarbageRef.current;
+        const gapCol = insertGarbageRows(board.current, count);
+        if (isTeamsCoop) insertedGarbage = { count, gapCol };
         pendingGarbageRef.current = 0;
       }
       setPendingGarbageDisplay(pendingGarbageRef.current);
@@ -1133,7 +1331,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
     // of the attack/garbage logic above. Co-op needs it for a different
     // reason: this IS the mechanism that syncs the shared board (see the
     // isCoop adopt effect below), not just a preview.
-    if (isMultiplayerRoom || isCoop) {
+    if (isMultiplayerRoom || isCoop || isTeamsCoop || isArena) {
       // nextPiecesRef[0] here (not player.current.type) — playerReset() below
       // hasn't shifted the queue yet at this point, so this is exactly the
       // piece about to spawn as the new active piece, without needing to
@@ -1146,7 +1344,13 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       // run yet) — exactly the delta co-op's merge-only sync needs. Sent
       // unconditionally like score/level/lines; versus/practice just don't
       // read it.
-      onBoardUpdate?.({ board: board.current, pieceMatrix: nextMatrix, pieceX: nextX, pieceY: 0, livesRemaining: livesRemainingRef.current, score: scoreRef.current, level: levelRef.current, lines: linesRef.current, next: nextPiecesRef.current.slice(0, 5), hold: holdPieceRef.current, lockedPieceMatrix: player.current.matrix, lockedPieceX: player.current.pos.x, lockedPieceY: player.current.pos.y });
+      onBoardUpdate?.({
+        board: board.current, pieceMatrix: nextMatrix, pieceX: nextX, pieceY: 0,
+        livesRemaining: livesRemainingRef.current, score: scoreRef.current, level: levelRef.current, lines: linesRef.current,
+        next: nextPiecesRef.current.slice(0, 5), hold: holdPieceRef.current,
+        lockedPieceMatrix: player.current.matrix, lockedPieceX: player.current.pos.x, lockedPieceY: player.current.pos.y,
+        ...(insertedGarbage ? { insertedGarbageCount: insertedGarbage.count, insertedGarbageGapCol: insertedGarbage.gapCol } : {}),
+      });
     }
 
     playerReset();
@@ -1337,12 +1541,12 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // Sandbox) calls this with its own tab, so they act as independent toggles
   // that share one underlying pause overlay.
   const openPanel = (tab: 'controls' | 'sandbox') => {
-    // No pausing in versus or co-op — see the matching guard in
-    // handleKeyDown's Escape/'p' branch for why. Neither the pause overlay
-    // nor a Settings button is offered for either mode (co-op's keybind/
-    // handling adjustment, like versus's, happens ahead of time in the
-    // lobby's standalone Controls panel).
-    if (mode === 'versus' || mode === 'coop') return;
+    // No pausing in versus, teams, teams-coop, or co-op — see the matching
+    // guard in handleKeyDown's Escape/'p' branch for why. Neither the pause
+    // overlay nor a Settings button is offered for any of these (their
+    // keybind/handling adjustment, like versus's, happens ahead of time in
+    // the lobby's standalone Controls panel).
+    if (mode === 'versus' || isTeams || isTeamsCoop || isArena || mode === 'coop') return;
     if (gameState === 'COUNTDOWN') return;
     if (showControlsRef.current && settingsTab === tab) {
       showControlsRef.current = false;
@@ -1385,13 +1589,13 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // much there. Recomputed at event time rather than every frame, matching
   // why TIME itself is a direct DOM write instead of React state.
   const countPiece = () => {
-    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus') return;
+    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus' && !isTeams && !isTeamsCoop && !isArena) return;
     piecesLockedRef.current += 1;
     const sec = elapsedTimeRef.current / 1000;
     setPps(sec > 0 ? piecesLockedRef.current / sec : 0);
   };
   const countAction = () => {
-    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus') return;
+    if (mode !== 'sprint' && mode !== 'blitz' && mode !== 'versus' && !isTeams && !isTeamsCoop && !isArena) return;
     actionsRef.current += 1;
     const min = elapsedTimeRef.current / 60000;
     setApm(min > 0 ? actionsRef.current / min : 0);
@@ -1485,53 +1689,63 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       for (let c = 0; c < COLS; c++) ctx.strokeRect(c * BLOCK_SIZE, r * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
     }
     drawMatrix(ctx, board.current, { x: 0, y: 0 });
-    // Co-op: the partner's live piece, drawn from the same broadcast data
-    // already powering opponent previews elsewhere — just composited onto
-    // this client's own board instead of a separate MiniBoard, since here
-    // it's genuinely the same board. Drawn before this client's own piece so
-    // an overlap (both pieces still airborne over the same cell) reads as
-    // "mine on top," not the reverse.
+    // Co-op / teams-coop: every teammate's live piece, drawn from the same
+    // broadcast data already powering opponent previews elsewhere — just
+    // composited onto this client's own board instead of a separate
+    // MiniBoard, since here it's genuinely the same board. Drawn before
+    // this client's own piece so an overlap (both pieces still airborne
+    // over the same cell) reads as "mine on top," not the reverse.
     // Read via the ref, not the opponentBoards prop directly — draw() only
     // ever runs through the requestAnimationFrame chain the mount-only
     // effect below kicks off, whose closure is frozen at mount (see
     // opponentBoardsRef's own comment). Reading the prop here would always
     // see whatever opponentBoards was on the very first render (normally
     // empty), which is why the partner's piece never actually appeared.
-    if (isCoop && opponentBoardsRef.current?.[0]?.pieceMatrix) {
-      const partner = opponentBoardsRef.current[0];
-      // Partner's own landing preview — same collision math as this
-      // client's own ghost (getGhostY), just run against the partner's
-      // piece/position instead of `player.current`, since it's genuinely
-      // the same shared board. Uses the dedicated 'partner-ghost' variant
-      // (fainter than the player's own ghost) rather than the 'ghost' one —
-      // the "2P" tag on the solid piece is what distinguishes whose ghost
-      // is whose, not a different ghost color.
-      let partnerGhostY = partner.pieceY;
-      while (!collide(board.current, { matrix: partner.pieceMatrix, pos: { x: partner.pieceX, y: partnerGhostY } })) {
-        partnerGhostY++;
-      }
-      partnerGhostY -= 1;
-      drawMatrix(ctx, partner.pieceMatrix, { x: partner.pieceX, y: partnerGhostY }, 'partner-ghost');
-      drawMatrix(ctx, partner.pieceMatrix, { x: partner.pieceX, y: partner.pieceY }, 'partner');
-      // "2P" tag pinned to the piece's own top-left cell (not a fixed
-      // corner of the board) so it stays legible and reads as "this piece
-      // is theirs" even as the piece moves/rotates across the board.
-      let tagCol = 0;
-      let tagRow = 0;
-      outerTag: for (let y = 0; y < partner.pieceMatrix.length; y++) {
-        for (let x = 0; x < partner.pieceMatrix[y].length; x++) {
-          if (partner.pieceMatrix[y][x] !== 0) { tagCol = x; tagRow = y; break outerTag; }
+    // mode/selfTeam/opponentNicknames are all stable match-start values
+    // (never change within one mount, same as `mode` itself), so reading
+    // them directly here — unlike opponentBoards — is safe without a ref.
+    if (isCoop || isTeamsCoop) {
+      const teammates = (opponentBoardsRef.current ?? []).filter((o) => (isTeamsCoop ? (opponentTeams?.[o.guestId] ?? 1) === selfTeam : true) && o.pieceMatrix);
+      for (const partner of teammates) {
+        // Teammate's own landing preview — same collision math as this
+        // client's own ghost (getGhostY), just run against the teammate's
+        // piece/position instead of `player.current`, since it's genuinely
+        // the same shared board. Uses the dedicated 'partner-ghost' variant
+        // (fainter than the player's own ghost) rather than the 'ghost' one
+        // — the tag on the solid piece is what distinguishes whose ghost is
+        // whose, not a different ghost color.
+        let teammateGhostY = partner.pieceY;
+        while (!collide(board.current, { matrix: partner.pieceMatrix, pos: { x: partner.pieceX, y: teammateGhostY } })) {
+          teammateGhostY++;
         }
+        teammateGhostY -= 1;
+        drawMatrix(ctx, partner.pieceMatrix, { x: partner.pieceX, y: teammateGhostY }, 'partner-ghost');
+        drawMatrix(ctx, partner.pieceMatrix, { x: partner.pieceX, y: partner.pieceY }, 'partner');
+        // Tag pinned to the piece's own top-left cell (not a fixed corner
+        // of the board) so it stays legible and reads as "this piece is
+        // theirs" even as the piece moves/rotates across the board. Coop
+        // (always exactly one partner) keeps the original "2P" text; teams-
+        // coop can have 2+ teammates sharing one board, so a truncated
+        // nickname is what actually distinguishes them from each other,
+        // not just from this client's own piece.
+        let tagCol = 0;
+        let tagRow = 0;
+        outerTag: for (let y = 0; y < partner.pieceMatrix.length; y++) {
+          for (let x = 0; x < partner.pieceMatrix[y].length; x++) {
+            if (partner.pieceMatrix[y][x] !== 0) { tagCol = x; tagRow = y; break outerTag; }
+          }
+        }
+        const tagText = isTeamsCoop ? (opponentNicknames?.[partner.guestId] || partner.guestId.slice(0, 4).toUpperCase()) : '2P';
+        const tagX = (partner.pieceX + tagCol) * BLOCK_SIZE + 2;
+        const tagY = (partner.pieceY + tagRow) * BLOCK_SIZE - 4;
+        ctx.globalAlpha = 1.0; ctx.shadowBlur = 0;
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textBaseline = 'bottom';
+        ctx.strokeStyle = 'rgba(0,0,0,0.8)'; ctx.lineWidth = 3;
+        ctx.strokeText(tagText, tagX, Math.max(tagY, 10));
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        ctx.fillText(tagText, tagX, Math.max(tagY, 10));
       }
-      const tagX = (partner.pieceX + tagCol) * BLOCK_SIZE + 2;
-      const tagY = (partner.pieceY + tagRow) * BLOCK_SIZE - 4;
-      ctx.globalAlpha = 1.0; ctx.shadowBlur = 0;
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textBaseline = 'bottom';
-      ctx.strokeStyle = 'rgba(0,0,0,0.8)'; ctx.lineWidth = 3;
-      ctx.strokeText('2P', tagX, Math.max(tagY, 10));
-      ctx.fillStyle = 'rgba(255,255,255,0.95)';
-      ctx.fillText('2P', tagX, Math.max(tagY, 10));
     }
     const ghostY = getGhostY();
     drawMatrix(ctx, player.current.matrix, { x: player.current.pos.x, y: ghostY }, 'ghost');
@@ -1564,7 +1778,38 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       if (!isPausedRef.current && !showControlsRef.current) {
         elapsedTimeRef.current = time - gameStartTimeRef.current;
 
-        if ((mode === 'sprint' || isSandboxRules || mode === 'versus' || isCoop) && timeDisplayRef.current) {
+        // timeBasedGravity: gravity ramps off elapsed match time instead of
+        // this player's own line clears (see the constants/comment above
+        // insertUnclearableRow), so every player in the same match speeds up
+        // identically regardless of how they're personally playing — and
+        // past the ramp, a solid unclearable row rises on a fixed schedule
+        // to force the match toward a close. Recomputed every frame off
+        // elapsedTimeRef rather than a timer, matching how this file already
+        // treats TIME/APM/PPS as "recompute from elapsed time," not ticks.
+        if (timeBasedGravity) {
+          const rampLevel = Math.min(
+            ARENA_GRAVITY_MAX_LEVEL,
+            1 + Math.floor(elapsedTimeRef.current / (ARENA_GRAVITY_RAMP_MS / (ARENA_GRAVITY_MAX_LEVEL - 1)))
+          );
+          if (rampLevel !== levelRef.current) {
+            levelRef.current = rampLevel;
+            dropInterval.current = calculateDropInterval(rampLevel);
+          }
+
+          if (elapsedTimeRef.current >= ARENA_GRAVITY_RAMP_MS) {
+            const expectedRows = Math.floor((elapsedTimeRef.current - ARENA_GRAVITY_RAMP_MS) / ARENA_SUDDEN_DEATH_ROW_INTERVAL_MS) + 1;
+            const newRows = expectedRows - suddenDeathRowsInsertedRef.current;
+            if (newRows > 0) {
+              if (suddenDeathRowsInsertedRef.current === 0) {
+                actionTextRef.current = { text: 'SUDDEN DEATH', timer: 2500 };
+              }
+              for (let i = 0; i < newRows; i++) insertUnclearableRow(board.current);
+              suddenDeathRowsInsertedRef.current = expectedRows;
+            }
+          }
+        }
+
+        if ((mode === 'sprint' || isSandboxRules || mode === 'versus' || isTeams || isTeamsCoop || isArena || isCoop) && timeDisplayRef.current) {
            // Sandbox's stopwatch just counts up, same as Sprint's — it's
            // reset (not stopped) whenever the board clears, in handleGameOver.
            timeDisplayRef.current.innerText = formatTime(elapsedTimeRef.current);
@@ -1676,7 +1921,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
       // Throttled rather than tied to any specific action, so it also covers
       // plain gravity between inputs, which the once-per-lock broadcast
       // alone never captured.
-      if ((isMultiplayerRoom || isCoop) && time - lastPreviewBroadcastRef.current > PREVIEW_BROADCAST_INTERVAL_MS) {
+      if ((isMultiplayerRoom || isCoop || isTeamsCoop || isArena) && time - lastPreviewBroadcastRef.current > PREVIEW_BROADCAST_INTERVAL_MS) {
         lastPreviewBroadcastRef.current = time;
         onBoardUpdate?.({ board: board.current, pieceMatrix: player.current.matrix, pieceX: player.current.pos.x, pieceY: player.current.pos.y, livesRemaining: livesRemainingRef.current, score: scoreRef.current, level: levelRef.current, lines: linesRef.current, next: nextPiecesRef.current.slice(0, 5), hold: holdPieceRef.current });
       }
@@ -1713,12 +1958,13 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         e.preventDefault(); 
       }
       
-      // Versus and co-op deliberately have no pause: freezing your own
-      // board (gravity, clock, DAS) while a live opponent/partner keeps
-      // playing is a "no" in real time — it's a free timeout only you get.
-      // Keybind/handling adjustment for both lives in the lobby's
-      // standalone ControlsSettings panel instead, before the match starts.
-      if ((e.key === 'p' || e.key === 'Escape') && mode !== 'versus' && mode !== 'coop') {
+      // Versus, teams, teams-coop, and co-op deliberately have no pause:
+      // freezing your own board (gravity, clock, DAS) while a live
+      // opponent/partner keeps playing is a "no" in real time — it's a
+      // free timeout only you get. Keybind/handling adjustment for all of
+      // these lives in the lobby's standalone ControlsSettings panel
+      // instead, before the match starts.
+      if ((e.key === 'p' || e.key === 'Escape') && mode !== 'versus' && !isTeams && !isTeamsCoop && !isArena && mode !== 'coop') {
         const willShow = !showControlsRef.current;
         showControlsRef.current = willShow;
         setShowControls(willShow);
@@ -1802,9 +2048,12 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
     const real = opponentBoards?.find((b) => b.guestId === guestId);
     const eliminated = eliminatedOpponentIds?.includes(guestId) ?? false;
     const nickname = opponentNicknames?.[guestId] || guestId.slice(0, 4).toUpperCase();
+    // Teams only — which team this opponent is on, for the compact preview
+    // column's grouped layout below. undefined for every other mode.
+    const team = opponentTeams?.[guestId];
     return real
-      ? { ...real, eliminated, nickname }
-      : { guestId, board: EMPTY_MINI_BOARD, pieceMatrix: undefined, pieceX: 0, pieceY: 0, eliminated, livesRemaining: lives ?? 1, nickname };
+      ? { ...real, eliminated, nickname, team }
+      : { guestId, board: EMPTY_MINI_BOARD, pieceMatrix: undefined, pieceX: 0, pieceY: 0, eliminated, livesRemaining: lives ?? 1, nickname, team };
   });
 
   // A genuine 1v1 (exactly one opponent) on a desktop-sized viewport gets its
@@ -1814,7 +2063,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
   // reading at a glance. Mobile keeps the compact column regardless (no
   // static pixel width for the main board there — it's a CSS min() against
   // viewport width — so there's nothing reliable to size 90% of).
-  const isDesktopOneVOne = isMultiplayerRoom && !isMobile && previewBoards.length === 1;
+  const isDesktopOneVOne = (isMultiplayerRoom || isArena) && !isMobile && previewBoards.length === 1;
   // Main board is a fixed COLS*BLOCK_SIZE (300px) canvas on desktop — sized
   // to match it exactly (100%), per feedback that a genuine 1v1 should read
   // as "their board, same size as mine," not a slightly-smaller preview.
@@ -1864,11 +2113,11 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
             </div>
           )}
 
-          {/* No Settings button in versus or co-op — see openPanel/
-              handleKeyDown for why pausing isn't allowed there. Keybinds/
-              handling for both are set ahead of time in the lobby's
-              Controls panel instead. */}
-          {(gameState === 'PLAYING' || gameState === 'COUNTDOWN') && mode !== 'versus' && mode !== 'coop' && (
+          {/* No Settings button in versus, teams, teams-coop, or co-op —
+              see openPanel/handleKeyDown for why pausing isn't allowed
+              there. Keybinds/handling for all of these are set ahead of
+              time in the lobby's Controls panel instead. */}
+          {(gameState === 'PLAYING' || gameState === 'COUNTDOWN') && mode !== 'versus' && !isTeams && !isTeamsCoop && !isArena && mode !== 'coop' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: isMobile ? '0.6rem' : '1.5rem' }}>
               <button
                 onClick={() => openPanel('controls')}
@@ -1895,17 +2144,17 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
             effect above). Solo modes (no room, no one else to vote with)
             keep the original instant behavior. */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-          {(isMultiplayerRoom || isCoop) && quitVoteDeadline != null && (
+          {(isMultiplayerRoom || isCoop || isTeamsCoop) && quitVoteDeadline != null && (
             <p style={{ fontSize: isMobile ? '0.5rem' : '0.6rem', color: 'rgba(255,255,255,0.6)', textAlign: 'center', lineHeight: 1.3, margin: 0 }}>
               {quitVoteCount}/{quitVoteTotal} vote to quit<br />{quitVoteRemainingSec}s
             </p>
           )}
           <button
-            onClick={!(isMultiplayerRoom || isCoop) ? onMenu : (selfQuitVote ? onRetractQuitVote : onQuitVote)}
+            onClick={!(isMultiplayerRoom || isCoop || isTeamsCoop) ? onMenu : (selfQuitVote ? onRetractQuitVote : onQuitVote)}
             style={{ padding: isMobile ? '5px 2px' : '8px', backgroundColor: 'color-mix(in srgb, var(--tt-accent) 15%, black)',
               color: 'var(--tt-accent)', border: '1px solid color-mix(in srgb, var(--tt-accent) 30%, transparent)', borderRadius: '4px',
               cursor: 'pointer', fontSize: isMobile ? '8px' : '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-            {(isMultiplayerRoom || isCoop) && selfQuitVote ? 'Cancel Vote' : 'Quit'}
+            {(isMultiplayerRoom || isCoop || isTeamsCoop) && selfQuitVote ? 'Cancel Vote' : 'Quit'}
           </button>
         </div>
       </div>
@@ -1916,7 +2165,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           turns lives on (see the HUD's own gating for why the default stays
           untouched). */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.4rem', flexShrink: 0 }}>
-        {mode === 'versus' && (lives ?? 1) > 1 && (
+        {(mode === 'versus' || isTeams || isTeamsCoop || isArena) && (lives ?? 1) > 1 && (
           <p style={{ fontSize: isMobile ? '0.6rem' : '0.75rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: isMobile ? '1px 6px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px', textTransform: 'uppercase' }}>
             Lives: {livesDisplay} / {lives}
           </p>
@@ -1933,7 +2182,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           with no other, taller siblings — and puts it directly against the
           board, per "right next to the game." */}
       <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'stretch', gap: isMobile ? '0.3rem' : '0.5rem' }}>
-        {mode === 'versus' && (
+        {(mode === 'versus' || isTeams || isTeamsCoop || isArena) && (
           <div style={{ alignSelf: 'stretch', width: isMobile ? '0.4rem' : '0.7rem', flexShrink: 0 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', height: '100%' }}>
               {/* Each segment represents 2 garbage lines rather than 1 —
@@ -2017,14 +2266,16 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           </div>
         )}
 
-        {/* VERSUS RESULT OVERLAY — Rematch returns to the lobby without
-            leaving the room (see onRematchMenu, wired in VersusApp). Reflects
-            either this client's own topout or outlasting every opponent (see
-            handleGameOver's versus branch and the last-standing effect above). */}
-        {gameState === 'LEADERBOARD' && mode === 'versus' && (
+        {/* VERSUS/TEAMS RESULT OVERLAY — Rematch returns to the lobby
+            without leaving the room (see onRematchMenu, wired in
+            VersusApp). Reflects either this client's own topout or
+            outlasting every opponent/enemy team (see handleGameOver's
+            versus/teams branch and the last-standing effect above); teams
+            reuses this overlay verbatim, only the win text differs. */}
+        {gameState === 'LEADERBOARD' && (mode === 'versus' || isTeams || isTeamsCoop || isArena) && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 30, padding: '2rem 1.5rem', overflowY: 'auto' }}>
             <h3 style={{ color: 'var(--tt-accent)', letterSpacing: '0.15em', marginBottom: '1rem', marginTop: 0, fontSize: '1.1rem', textAlign: 'center' }}>
-              {versusOutcome === 'won-last-standing' && 'YOU WIN — LAST ONE STANDING'}
+              {versusOutcome === 'won-last-standing' && ((isTeams || isTeamsCoop) ? 'YOU WIN — LAST TEAM STANDING' : 'YOU WIN — LAST ONE STANDING')}
               {versusOutcome === 'lost-topout' && 'TOPPED OUT'}
             </h3>
             <p style={{ color: 'white', fontSize: '2rem', fontWeight: 'bold', textShadow: '0 0 10px rgba(255,255,255,0.5)', margin: '0 0 2rem 0' }}>
@@ -2034,8 +2285,13 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
               onClick={onRematchMenu}
               style={{ backgroundColor: 'var(--tt-accent)', color: 'white', border: 'none', borderRadius: '4px', padding: '10px 32px', cursor: 'pointer', textTransform: 'uppercase', fontSize: '14px', letterSpacing: '0.1em', fontWeight: 'bold' }}
             >
-              Rematch
+              {isArena ? 'Back to Queue' : 'Rematch'}
             </button>
+            {isArena && (
+              <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.65rem', marginTop: '0.75rem', textAlign: 'center' }}>
+                Returning to the queue automatically...
+              </p>
+            )}
           </div>
         )}
 
@@ -2065,7 +2321,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
         )}
 
         {/* LEADERBOARD OVERLAY */}
-        {gameState === 'LEADERBOARD' && mode !== 'versus' && mode !== 'coop' && (
+        {gameState === 'LEADERBOARD' && mode !== 'versus' && !isTeams && !isTeamsCoop && !isArena && mode !== 'coop' && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', display: 'flex', flexDirection: 'column', alignItems: 'center', zIndex: 30, padding: '2rem 1.5rem', overflowY: 'auto' }}>
             <h3 style={{ color: 'white', letterSpacing: '0.2em', marginBottom: '1.5rem', marginTop: 0, fontSize: '1.25rem', textShadow: '0 0 10px rgba(255,255,255,0.3)' }}>LEADERBOARD</h3>
             
@@ -2360,7 +2616,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
                 <p style={{ fontSize: isMobile ? '0.9rem' : '1.25rem', color: 'rgba(255,255,255,0.95)', fontWeight: 'bold', margin: 0 }}>{apm.toFixed(0)}</p>
               </div>
             </>
-          ) : mode === 'versus' ? (
+          ) : (mode === 'versus' || isTeams || isTeamsCoop || isArena) ? (
             <>
               <div>
                 <p style={{ fontSize: isMobile ? '7px' : '10px', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '0.25rem', margin: 0 }}>Time</p>
@@ -2495,7 +2751,7 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
               room that had Lives > 1 set before switching to Practice would
               otherwise still show a stale lives tag, even though Practice
               has no lives/elimination concept at all. */}
-          {mode === 'versus' && (lives ?? 1) > 1 && (
+          {(mode === 'versus' || isTeams || isTeamsCoop || isArena) && (lives ?? 1) > 1 && (
             <p style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.6)', letterSpacing: '0.08em', textAlign: 'center', fontWeight: 'bold', margin: 0, padding: '2px 8px', backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '4px' }}>
               {previewBoards[0].livesRemaining} / {lives} LIVES
             </p>
@@ -2513,45 +2769,110 @@ export default function TetrisGame({ mode, onMenu, onAttack, incomingGarbage, on
           opponents up to a full room without a per-count layout. A single
           opponent (mobile 1v1) still gets a size bump over a fuller room,
           just not the full side-by-side treatment. */}
-      {isMultiplayerRoom && !isDesktopOneVOne && previewBoards.length > 0 && (() => {
-        const isOneVOne = previewBoards.length === 1;
+      {(isMultiplayerRoom || isTeamsCoop || isArena) && !isDesktopOneVOne && previewBoards.length > 0 && (() => {
+        // Teams-coop only — one deduped entry per *enemy* team (every
+        // teammate on a team shares identical board content, so showing one
+        // MiniBoard per enemy player, like plain Teams does, would just be
+        // visibly duplicate boards) — any one representative member's
+        // broadcast stands in for the whole team. Own team is never shown
+        // here at all, same reasoning Co-op already established: it's
+        // rendered directly on this client's own canvas above, not as a
+        // side preview. Computed before isOneVOne/cellSize below so sizing
+        // reflects the actual number of *rendered* groups, not the raw
+        // player count (which would include teammates never shown here).
+        const enemyTeamBoards = isTeamsCoop
+          ? Array.from(
+              previewBoards.reduce((acc, entry) => {
+                const t = entry.team ?? 1;
+                if (t !== selfTeam && !acc.has(t)) acc.set(t, entry);
+                return acc;
+              }, new Map<number, typeof previewBoards[number]>())
+            ).sort(([a], [b]) => a - b)
+          : null;
+        const renderCount = enemyTeamBoards ? enemyTeamBoards.length : previewBoards.length;
+        const isOneVOne = renderCount === 1;
         // Multi-player bumped another 5% (5.5 -> 5.775) on top of the
         // earlier +10% bump over its original 5px base, per feedback that a
         // fuller room's previews still read too small.
         const cellSize = isOneVOne ? 7.5 : 5.775;
+        // One MiniBoard "row" per entry, shared between the flat list
+        // (versus/practice), the team-grouped layout (teams), and the
+        // enemy-team-deduped layout (teams-coop) below so the actual board/
+        // lives-tag markup isn't duplicated three times. `labelOverride`
+        // exists only for teams-coop — a deduped enemy-team entry should
+        // read "TEAM N", not the one representative member's own nickname.
+        const renderEntry = (entry: typeof previewBoards[number], labelOverride?: string) => (
+          <div key={entry.guestId} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.15rem' }}>
+            {(!isOneVOne || labelOverride) && (
+              <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.75)', fontWeight: 'bold', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                {labelOverride ?? entry.nickname}
+              </span>
+            )}
+            {/* Each opponent needs their own count here (unlike the shared
+                heading above), since lives remaining can differ from one to
+                the next. Guard is for the same stale-setting reason as the
+                1v1 board's lives tag above. */}
+            {(mode === 'versus' || isTeams || isTeamsCoop || isArena) && (lives ?? 1) > 1 && (
+              <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.6)', fontWeight: 'bold' }}>
+                {entry.livesRemaining} / {lives}
+              </span>
+            )}
+            <MiniBoard board={entry.board} cellSize={cellSize} pieceMatrix={entry.pieceMatrix} pieceX={entry.pieceX} pieceY={entry.pieceY} eliminated={entry.eliminated} eliminatedLabel={mode === 'practice' ? 'Left' : 'Eliminated'} />
+          </div>
+        );
+        // Teams: group previewBoards by team (own team first, labeled "Your
+        // Team"; each other team gets its own "Team N" group) instead of one
+        // flat list — per direct request, so it's immediately clear at a
+        // glance who's a teammate vs. an enemy rather than only readable via
+        // each board's own nickname label.
+        const teamGroups = isTeams
+          ? Array.from(
+              previewBoards.reduce((acc, entry) => {
+                const t = entry.team ?? 1;
+                if (!acc.has(t)) acc.set(t, []);
+                acc.get(t)!.push(entry);
+                return acc;
+              }, new Map<number, typeof previewBoards>())
+            ).sort(([a], [b]) => (a === selfTeam ? -1 : b === selfTeam ? 1 : a - b))
+          : null;
         return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', width: isOneVOne ? '9rem' : '6rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem' }}>
-            {/* A true 1v1 (mobile, or a fuller room down to one survivor)
-                just needs the nickname — nothing to tell apart from. A
-                fuller room keeps the generic OPPONENTS heading up top and
-                labels each board individually below instead, since that's
-                the only place lives/nickname can actually differ board to
-                board. */}
-            <p style={{ fontSize: isMobile ? '0.55rem' : '0.7rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
-              {isOneVOne ? previewBoards[0].nickname : (mode === 'practice' ? 'PLAYERS' : 'OPPONENTS')}
-            </p>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center', maxHeight: isMobile ? 'none' : '600px', overflowY: 'auto' }}>
-              {previewBoards.map((entry) => (
-                <div key={entry.guestId} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.15rem' }}>
-                  {!isOneVOne && (
-                    <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.75)', fontWeight: 'bold', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
-                      {entry.nickname}
-                    </span>
-                  )}
-                  {/* Each opponent needs their own count here (unlike the
-                      shared OPPONENT/OPPONENTS label above), since lives
-                      remaining can differ from one to the next. mode ===
-                      'versus' guard for the same stale-setting reason as the
-                      1v1 board's lives tag above. */}
-                  {mode === 'versus' && (lives ?? 1) > 1 && (
-                    <span style={{ fontSize: isMobile ? '0.5rem' : '0.55rem', color: 'rgba(255,255,255,0.6)', fontWeight: 'bold' }}>
-                      {entry.livesRemaining} / {lives}
-                    </span>
-                  )}
-                  <MiniBoard board={entry.board} cellSize={cellSize} pieceMatrix={entry.pieceMatrix} pieceX={entry.pieceX} pieceY={entry.pieceY} eliminated={entry.eliminated} eliminatedLabel={mode === 'practice' ? 'Left' : 'Eliminated'} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: (isTeams || isTeamsCoop) ? '0.75rem' : '0.4rem', width: isOneVOne ? '9rem' : '6rem', flexShrink: 0, paddingTop: isMobile ? 0 : '1rem' }}>
+            {enemyTeamBoards ? (
+              // Teams-coop: one deduped board per enemy team, no "YOUR TEAM"
+              // section at all — own team is already this client's own main
+              // board (see the canvas overlay above), not a side preview.
+              enemyTeamBoards.map(([teamNumber, entry]) => (
+                <div key={teamNumber} style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center' }}>
+                  {renderEntry(entry, `TEAM ${teamNumber}`)}
                 </div>
-              ))}
-            </div>
+              ))
+            ) : teamGroups ? (
+              teamGroups.map(([teamNumber, entries]) => (
+                <div key={teamNumber} style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                  <p style={{ fontSize: isMobile ? '0.55rem' : '0.7rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: teamNumber === selfTeam ? 'color-mix(in srgb, var(--tt-accent) 30%, rgba(0,0,0,0.75))' : 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
+                    {teamNumber === selfTeam ? 'YOUR TEAM' : `TEAM ${teamNumber}`}
+                  </p>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center' }}>
+                    {entries.map((entry) => renderEntry(entry))}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <>
+                {/* A true 1v1 (mobile, or a fuller room down to one survivor)
+                    just needs the nickname — nothing to tell apart from. A
+                    fuller room keeps the generic OPPONENTS heading up top and
+                    labels each board individually below instead, since that's
+                    the only place lives/nickname can actually differ board to
+                    board. */}
+                <p style={{ fontSize: isMobile ? '0.55rem' : '0.7rem', color: 'rgba(255,255,255,0.7)', letterSpacing: '0.1em', textAlign: 'center', fontWeight: 'bold', margin: '0 auto', width: 'fit-content', padding: isMobile ? '1px 5px' : '2px 8px', backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: '4px' }}>
+                  {isOneVOne ? previewBoards[0].nickname : (mode === 'practice' ? 'PLAYERS' : 'OPPONENTS')}
+                </p>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'center', maxHeight: isMobile ? 'none' : '600px', overflowY: 'auto' }}>
+                  {previewBoards.map((entry) => renderEntry(entry))}
+                </div>
+              </>
+            )}
           </div>
         );
       })()}

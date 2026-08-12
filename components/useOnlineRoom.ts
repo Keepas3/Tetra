@@ -18,6 +18,12 @@ import { supabase } from '../app/utils/supabaseClient';
 
 export const MAX_ROOM_SIZE = 8;
 
+// Teams/Teams Co-op display names, 1-indexed to match the `team` field
+// (team 1 -> TEAM_NAMES[0]) — used everywhere a team number would otherwise
+// be shown raw (lobby picker/roster, in-match preview column labels) so a
+// player only ever sees "Blue"/"Red"/"Green"/"Yellow", never "Team 3".
+export const TEAM_NAMES = ['Blue', 'Red', 'Green', 'Yellow'];
+
 // A mid-match Quit is a vote, not a unilateral exit — the first vote opens
 // this window; if every still-active player (anyone who hasn't already
 // disconnected/been eliminated) votes to quit before it closes, everyone is
@@ -49,9 +55,20 @@ export type RoomStatus = 'idle' | 'connecting' | 'waiting' | 'occupied';
 // no attacks/lives/elimination/win-condition. 'coop' = exactly two players
 // sharing one board, each controlling their own independently-falling piece
 // (see TetrisGame.tsx's isCoop) — score/level/lines are team-shared, either
-// player topping out ends it for both. Future modes (powerups) extend this
-// union rather than each getting a bespoke protocol.
-export type GameMode = 'versus' | 'practice' | 'coop';
+// player topping out ends it for both. 'teams' = 2-4 self-selected teams
+// (see the `team` field below), each player on their own separate board —
+// unlike coop, garbage is versus's usual per-player attack/lives/elimination
+// exchange, just restricted to opposing-team targets only (see VersusApp's
+// handleAttack), and the match ends once every player on every other team is
+// eliminated (see TetrisGame.tsx's enemyIds prop). 'teams-coop' = the same
+// team structure as 'teams' (self-selected, Team Count, enemy-only garbage,
+// last-team-standing), except each *team* shares one board the way coop's
+// two players do — coop's merge-only sync generalizes to however many share
+// a team (see TetrisGame.tsx's isTeamsCoop), and Lives becomes a team-wide
+// resource instead of per-player (see BoardSnapshotPayload.livesRemaining's
+// own comment). Future modes (powerups) extend this union rather than each
+// getting a bespoke protocol.
+export type GameMode = 'versus' | 'practice' | 'coop' | 'teams' | 'teams-coop';
 
 interface ReadyPayload {
   guestId: string;
@@ -87,6 +104,11 @@ interface StartPayload {
   // shared slot both players can swap into and each player's Next queue is
   // visible to their partner, vs. staying fully private to each player.
   sharedNextHold: boolean;
+  // Teams only — locked in at match start alongside the rest of these,
+  // same reasoning as lives/startingLevel: a later settings change (e.g.
+  // during a still-open lobby before Ready) shouldn't retroactively alter a
+  // match already in flight.
+  teamCount: number;
 }
 
 interface KickPayload {
@@ -101,11 +123,18 @@ interface KickPayload {
 interface PresenceMeta {
   nickname: string;
   isHost: boolean;
+  // Self-selected (see setTeam below), not host-controlled — every player's
+  // own presence entry carries it directly, same as nickname, rather than
+  // being part of the host-only settings block below it.
+  team?: number;
   maxPlayers?: number;
   startingLevel?: number;
   lives?: number;
   gameMode?: GameMode;
   sharedNextHold?: boolean;
+  // Teams only, host-only (see roomSettings.teamCount) — how many teams the
+  // room is split into (2-4); each team's size is maxPlayers / teamCount.
+  teamCount?: number;
   // When this client originally joined — fixed at join time (see joinedAtRef),
   // not updated by retrack(). Not part of `meta` at either track() call site
   // (added alongside it as a sibling field instead — see joinChannel/retrack),
@@ -140,7 +169,10 @@ interface BoardSnapshotPayload {
   pieceY: number;
   // Their current lives remaining (only meaningful when the match's lives
   // setting is above the 1-life default) — lets an opponent-preview show it
-  // per-opponent without a separate broadcast.
+  // per-opponent without a separate broadcast. Teams-coop only: this is
+  // TEAM-wide, not per-player (there's only one shared board to lose lives
+  // on) — the receiving adopt-effect min-merges it (Math.min, since lives
+  // only ever go down) rather than reading it as one player's own count.
   livesRemaining: number;
   // Co-op-only: the sender's own running score/level/lines. The receiving
   // client takes Math.max(mine, received) for each — not a blind overwrite
@@ -177,6 +209,24 @@ interface BoardSnapshotPayload {
   // versus/practice/coop-without-sharing just don't read them.
   next: number[];
   hold: number | null;
+  // Teams-coop only, present ONLY on the lock broadcast where this client
+  // actually called insertGarbageRows (never on the periodic tick) — the
+  // exact row count and gap column it used. A shared board can't have every
+  // teammate independently roll their own random gap column (they'd
+  // diverge immediately, the one thing merge-only sync exists to prevent),
+  // so garbage insertion is single-writer: whichever teammate's lock
+  // applies it broadcasts the exact operation here, and the rest replay it
+  // verbatim (never reroll) via the same insertGarbageRows call with this
+  // gapCol passed in, mirroring lockedPieceMatrix's own "present only when
+  // this specific event happened" contract exactly.
+  insertedGarbageCount?: number;
+  insertedGarbageGapCol?: number;
+  // Teams-coop only, present ONLY on the broadcast fired at the exact
+  // moment a client soft-resets after topping out with team lives still
+  // remaining — tells every teammate to clear their own local board copy
+  // and adopt the (lower) livesRemaining above, not just the one client
+  // that actually topped out.
+  sharedBoardCleared?: boolean;
 }
 
 interface QuickChatPayload {
@@ -223,14 +273,17 @@ function randomGuestId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-const NICKNAME_STORAGE_KEY = 'tetris-arena:nickname';
-const DEFAULT_ROOM_SETTINGS = { maxPlayers: MAX_ROOM_SIZE, startingLevel: 1, lives: 1, gameMode: 'versus' as GameMode, sharedNextHold: false };
+// Exported so useArena.ts can reuse the exact same key — a nickname set in
+// either place should be visible in the other, they're the same "who am I"
+// concept site-wide, not two separate identities.
+export const NICKNAME_STORAGE_KEY = 'tetris-arena:nickname';
+const DEFAULT_ROOM_SETTINGS = { maxPlayers: MAX_ROOM_SIZE, startingLevel: 1, lives: 1, gameMode: 'versus' as GameMode, sharedNextHold: false, teamCount: 2 };
 
 export function useOnlineRoom() {
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [status, setStatus] = useState<RoomStatus>('idle');
-  const [opponents, setOpponents] = useState<{ guestId: string; nickname: string }[]>([]);
+  const [opponents, setOpponents] = useState<{ guestId: string; nickname: string; team?: number }[]>([]);
   const [selfReady, setSelfReady] = useState(false);
   const [readyGuestIds, setReadyGuestIds] = useState<Set<string>>(new Set());
   const [startAt, setStartAt] = useState<number | null>(null);
@@ -239,6 +292,7 @@ export function useOnlineRoom() {
   const [matchLives, setMatchLives] = useState<number | null>(null);
   const [matchGameMode, setMatchGameMode] = useState<GameMode | null>(null);
   const [matchSharedNextHold, setMatchSharedNextHold] = useState<boolean | null>(null);
+  const [matchTeamCount, setMatchTeamCount] = useState<number | null>(null);
   // Mid-match quit vote. selfQuitVote/quitVotes mirror selfReady/readyGuestIds
   // exactly (self tracked separately since a client doesn't receive its own
   // broadcast) — TetrisGame is what actually knows the match's active roster
@@ -259,6 +313,11 @@ export function useOnlineRoom() {
   // everyone else via presence (see PresenceMeta) rather than a Postgres
   // column, matching this project's no-database-table architecture.
   const [nickname, setNicknameState] = useState('');
+  // Own self-selected team (Teams mode only) — unlike nickname, deliberately
+  // not persisted to localStorage; a team choice only makes sense within one
+  // room's roster, not carried forward to the next room. Broadcast via
+  // presence the same way (see PresenceMeta.team, retrack, setTeam below).
+  const [team, setTeamState] = useState(1);
   // Whichever presence entry has isHost:true — lets any client (including a
   // guest) find the host's entry to read maxPlayers/startingLevel, and lets
   // the lobby show a "(Host)" label without a separate broadcast.
@@ -288,12 +347,13 @@ export function useOnlineRoom() {
   // Mirrors `opponents` so the presence-sync handler can diff against the
   // previous snapshot (a plain closure over `opponents` state would be stale
   // — this handler is wired up once per joinChannel call, not per render).
-  const opponentsRef = useRef<{ guestId: string; nickname: string }[]>([]);
+  const opponentsRef = useRef<{ guestId: string; nickname: string; team?: number }[]>([]);
   // Mirror nickname/isHost/roomSettings/joinedAt so retrack() and the
   // subscribe callback always read the latest values without needing to
   // resubscribe the channel (a plain closure over state would go stale,
   // same reasoning as opponentsRef above).
   const nicknameRef = useRef('');
+  const teamRef = useRef(1);
   const isHostRef = useRef(false);
   const roomSettingsRef = useRef(DEFAULT_ROOM_SETTINGS);
   const joinedAtRef = useRef(0);
@@ -308,6 +368,18 @@ export function useOnlineRoom() {
 
   const allReady = opponents.length > 0 && opponents.every((o) => readyGuestIds.has(o.guestId));
 
+  // Teams/Teams Co-op only: a match where every joined player picked the
+  // same team has no opponent to actually play against (Teams' win check —
+  // "every enemy eliminated" — would be vacuously true against an empty
+  // enemy roster the instant the match started). Checked against the full
+  // roster (self + opponents), not just >1 distinct value among opponents
+  // alone, since a lone host sitting on Team 1 with everyone else also on
+  // Team 1 is exactly the case this is meant to catch.
+  const teamsConflict =
+    (roomSettings.gameMode === 'teams' || roomSettings.gameMode === 'teams-coop') &&
+    opponents.length > 0 &&
+    new Set([team, ...opponents.map((o) => o.team ?? 1)]).size < 2;
+
   // Re-publishes this client's presence payload with current ref values —
   // called after nickname or (host-only) room settings change, so everyone
   // else's presence sync picks up the update. joinedAt is fixed at the
@@ -318,6 +390,7 @@ export function useOnlineRoom() {
     const meta: PresenceMeta = {
       nickname: nicknameRef.current,
       isHost: isHostRef.current,
+      team: teamRef.current,
       ...(isHostRef.current ? roomSettingsRef.current : {}),
     };
     channelRef.current.track({ joinedAt: joinedAtRef.current, ...meta });
@@ -340,6 +413,7 @@ export function useOnlineRoom() {
     setMatchSeed(null);
     setMatchStartingLevel(null);
     setMatchLives(null);
+    setMatchTeamCount(null);
     setIncomingGarbage(null);
     setEliminatedGuestIds(new Set());
     setOpponentBoards([]);
@@ -350,6 +424,8 @@ export function useOnlineRoom() {
     setHostGuestId(null);
     setRoomSettings(DEFAULT_ROOM_SETTINGS);
     roomSettingsRef.current = DEFAULT_ROOM_SETTINGS;
+    setTeamState(1);
+    teamRef.current = 1;
     setQuickChatLog([]);
   }, []);
 
@@ -379,7 +455,7 @@ export function useOnlineRoom() {
       const state = channel.presenceState<PresenceMeta>();
       const others = Object.keys(state)
         .filter((key) => key !== guestId)
-        .map((key) => ({ guestId: key, nickname: state[key][0]?.nickname ?? '' }));
+        .map((key) => ({ guestId: key, nickname: state[key][0]?.nickname ?? '', team: state[key][0]?.team }));
 
       // Room size is otherwise informational (see setMaxPlayers) — this is
       // the one place it's actually enforced, and only client-side: a guest
@@ -437,6 +513,7 @@ export function useOnlineRoom() {
           lives: meta.lives ?? 1,
           gameMode: meta.gameMode ?? 'versus',
           sharedNextHold: meta.sharedNextHold ?? false,
+          teamCount: meta.teamCount ?? 2,
         };
         setRoomSettings(nextSettings);
         roomSettingsRef.current = nextSettings;
@@ -523,6 +600,7 @@ export function useOnlineRoom() {
       setMatchLives(payload.lives);
       setMatchGameMode(payload.gameMode);
       setMatchSharedNextHold(payload.sharedNextHold);
+      setMatchTeamCount(payload.teamCount);
     });
 
     // The promoting client already appended this locally (see the
@@ -584,6 +662,7 @@ export function useOnlineRoom() {
         const meta: PresenceMeta = {
           nickname: nicknameRef.current,
           isHost: host,
+          team: teamRef.current,
           ...(host ? roomSettingsRef.current : {}),
         };
         await channel.track({ joinedAt: joinedAtRef.current, ...meta });
@@ -748,8 +827,16 @@ export function useOnlineRoom() {
     // assumes exactly one partner (opponentBoards[0]) — it was never built
     // to merge N boards together. Force the room down to 2 the moment
     // Co-op is selected, same as any other host setting, rather than
-    // letting a bigger room silently misbehave once a match starts.
-    const next = { ...roomSettingsRef.current, gameMode: m, maxPlayers: m === 'coop' ? 2 : roomSettingsRef.current.maxPlayers };
+    // letting a bigger room silently misbehave once a match starts. Both
+    // team modes get the same treatment but derived from teamCount (2 per
+    // team by default) instead of a flat constant — setTeamCount below
+    // re-derives this same maxPlayers whenever teamCount itself changes
+    // afterward.
+    const next = {
+      ...roomSettingsRef.current,
+      gameMode: m,
+      maxPlayers: m === 'coop' ? 2 : (m === 'teams' || m === 'teams-coop') ? roomSettingsRef.current.teamCount * 2 : roomSettingsRef.current.maxPlayers,
+    };
     roomSettingsRef.current = next;
     setRoomSettings(next);
     retrack();
@@ -759,6 +846,30 @@ export function useOnlineRoom() {
     const next = { ...roomSettingsRef.current, sharedNextHold: shared };
     roomSettingsRef.current = next;
     setRoomSettings(next);
+    retrack();
+  }, [retrack]);
+
+  // Teams only — re-derives maxPlayers to 2-per-team whenever the team
+  // count itself changes (same "force the dependent setting in the same
+  // update" pattern setGameMode already uses for Co-op's fixed room of 2),
+  // so switching from 2 to 4 teams doesn't silently leave the room capped
+  // at a size too small to fit them. The host can still bump Room Size up
+  // afterward via its own selector (filtered to multiples of teamCount —
+  // see OnlineLobby.tsx) for more than 2 players per team.
+  const setTeamCount = useCallback((n: number) => {
+    const next = { ...roomSettingsRef.current, teamCount: n, maxPlayers: n * 2 };
+    roomSettingsRef.current = next;
+    setRoomSettings(next);
+    retrack();
+  }, [retrack]);
+
+  // Self-selected (Teams mode only) — every player picks their own, not
+  // host-assigned (see PresenceMeta.team). Room-scoped only, unlike
+  // nickname: not persisted to localStorage, since a team choice made in
+  // one room has no meaning in the next.
+  const setTeam = useCallback((n: number) => {
+    setTeamState(n);
+    teamRef.current = n;
     retrack();
   }, [retrack]);
 
@@ -786,6 +897,7 @@ export function useOnlineRoom() {
     setMatchLives(null);
     setMatchGameMode(null);
     setMatchSharedNextHold(null);
+    setMatchTeamCount(null);
     setIncomingGarbage(null);
     setEliminatedGuestIds(new Set());
     setOpponentBoards([]);
@@ -804,23 +916,24 @@ export function useOnlineRoom() {
   // actually arrive before it's due; all clients (host included) just
   // schedule off the received/computed timestamp.
   useEffect(() => {
-    if (isHost && selfReady && allReady && !startAt) {
+    if (isHost && selfReady && allReady && !startAt && !teamsConflict) {
       const at = Date.now() + 1500;
       const seed = Math.floor(Math.random() * 2 ** 31);
-      const { startingLevel, lives, gameMode, sharedNextHold } = roomSettingsRef.current;
+      const { startingLevel, lives, gameMode, sharedNextHold, teamCount } = roomSettingsRef.current;
       setStartAt(at);
       setMatchSeed(seed);
       setMatchStartingLevel(startingLevel);
       setMatchLives(lives);
       setMatchGameMode(gameMode);
       setMatchSharedNextHold(sharedNextHold);
+      setMatchTeamCount(teamCount);
       channelRef.current?.send({
         type: 'broadcast',
         event: 'start',
-        payload: { startAt: at, seed, startingLevel, lives, gameMode, sharedNextHold } satisfies StartPayload,
+        payload: { startAt: at, seed, startingLevel, lives, gameMode, sharedNextHold, teamCount } satisfies StartPayload,
       });
     }
-  }, [isHost, selfReady, allReady, startAt]);
+  }, [isHost, selfReady, allReady, startAt, teamsConflict]);
 
   // Closes an all-retracted vote early rather than leaving a "0 votes, still
   // counting down" window visible — every client independently notices it
@@ -862,12 +975,14 @@ export function useOnlineRoom() {
     selfReady,
     readyGuestIds,
     allReady,
+    teamsConflict,
     startAt,
     matchSeed,
     matchStartingLevel,
     matchLives,
     matchGameMode,
     matchSharedNextHold,
+    matchTeamCount,
     selfQuitVote,
     quitVotes,
     quitVoteDeadline,
@@ -885,6 +1000,9 @@ export function useOnlineRoom() {
     setLives,
     setGameMode,
     setSharedNextHold,
+    setTeamCount,
+    team,
+    setTeam,
     sendKick,
     wasKicked,
     roomFull,

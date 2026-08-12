@@ -12,6 +12,7 @@ export const COLORS = [
   '#0ea5e9', // 6: J - Blue
   '#fb923c', // 7: L - Orange
   '#6b7280', // 8: Garbage
+  '#7f1d1d', // 9: Unclearable (sudden-death rising floor)
 ];
 
 export const PIECES = [

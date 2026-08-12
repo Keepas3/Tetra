@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { MAX_ROOM_SIZE, QUICK_CHAT_MESSAGES, type QuickChatEntry, type GameMode } from './useOnlineRoom';
+import { MAX_ROOM_SIZE, QUICK_CHAT_MESSAGES, TEAM_NAMES, type QuickChatEntry, type GameMode } from './useOnlineRoom';
 import ControlsSettings from './ControlsSettings';
 
 // Guideline-style speed curve tops out well before this (see
@@ -23,7 +23,7 @@ interface OnlineLobbyProps {
   // TetrisGame once the match starts (needed for garbage exchange).
   roomCode: string | null;
   isHost: boolean;
-  opponents: { guestId: string; nickname: string }[];
+  opponents: { guestId: string; nickname: string; team?: number }[];
   selfReady: boolean;
   readyGuestIds: Set<string>;
   startAt: number | null;
@@ -50,7 +50,7 @@ interface OnlineLobbyProps {
   // Whichever opponent (or self) is hosting — drives the "(Host)" label and
   // gates the host-only settings/kick controls below.
   hostGuestId: string | null;
-  roomSettings: { maxPlayers: number; startingLevel: number; lives: number; gameMode: GameMode; sharedNextHold: boolean };
+  roomSettings: { maxPlayers: number; startingLevel: number; lives: number; gameMode: GameMode; sharedNextHold: boolean; teamCount: number };
   setMaxPlayers: (n: number) => void;
   setStartingLevel: (n: number) => void;
   setLives: (n: number) => void;
@@ -62,6 +62,14 @@ interface OnlineLobbyProps {
   // queue is visible to their partner, or both stay fully private per
   // player (the default).
   setSharedNextHold: (shared: boolean) => void;
+  // Teams only, host-only — how many teams the room splits into (2-4); each
+  // team's size is roomSettings.maxPlayers / teamCount.
+  setTeamCount: (n: number) => void;
+  // Teams only, self-selected — every player (including this client) picks
+  // their own team, not host-assigned. `team` is this client's own current
+  // pick, defaulting to 1.
+  team: number;
+  setTeam: (n: number) => void;
   // Host-only removal — informational room-size cap doesn't reject joins on
   // its own (see useOnlineRoom), so this is the actual enforcement tool.
   sendKick: (guestId: string) => void;
@@ -77,6 +85,12 @@ interface OnlineLobbyProps {
   // only shown once actually in a room, there's no one to talk to before that.
   quickChatLog: QuickChatEntry[];
   sendQuickChat: (messageId: number) => void;
+  // Teams/Teams Co-op only — true when every joined player (self included)
+  // picked the same team, which would leave no enemy roster for the match
+  // to actually run against. Blocks the host's start effect in
+  // useOnlineRoom (see teamsConflict there) — this prop just drives the
+  // matching lobby message so it's not a silent no-op.
+  teamsConflict: boolean;
 }
 
 const PANEL_STYLE: React.CSSProperties = {
@@ -182,8 +196,9 @@ export default function OnlineLobby({
   createRoom, joinRoom, sendReady, sendUnready, leaveRoom,
   quickplayStatus, onQuickplaySearch, onQuickplayCancel,
   winCount,
-  nickname, setNickname, hostGuestId, roomSettings, setMaxPlayers, setStartingLevel, setLives, setGameMode, setSharedNextHold, sendKick, wasKicked, roomFull,
+  nickname, setNickname, hostGuestId, roomSettings, setMaxPlayers, setStartingLevel, setLives, setGameMode, setSharedNextHold, setTeamCount, team, setTeam, sendKick, wasKicked, roomFull,
   quickChatLog, sendQuickChat,
+  teamsConflict,
 }: OnlineLobbyProps) {
   const [entryMode, setEntryMode] = useState<'choose' | 'joining'>('choose');
   const [joinCodeInput, setJoinCodeInput] = useState('');
@@ -239,6 +254,27 @@ export default function OnlineLobby({
   useEffect(() => {
     if (wasKicked || roomFull) setEntryMode('choose');
   }, [wasKicked, roomFull]);
+
+  // Both team modes (Teams and Teams Co-op) share every bit of this room/
+  // lobby machinery — Team Count, self-select team, Room Size filtering —
+  // teams-coop only differs once a match is actually running (shared board
+  // vs. separate ones), which lives entirely in TetrisGame.tsx/VersusApp.tsx.
+  const isTeamsMode = roomSettings.gameMode === 'teams' || roomSettings.gameMode === 'teams-coop';
+
+  // Per-team member counts (including self), used to soft-cap the self-
+  // picker below at teamSize per team. Client-side only, same "no locking,
+  // accepted small races at this scale" tradeoff as room capacity and every
+  // other soft cap in this file — two players picking the last open slot on
+  // the same team in the same instant could both slip in.
+  const teamSize = isTeamsMode ? Math.max(1, Math.floor(roomSettings.maxPlayers / roomSettings.teamCount)) : 0;
+  const teamCounts: Record<number, number> = {};
+  if (isTeamsMode) {
+    teamCounts[team] = (teamCounts[team] ?? 0) + 1;
+    opponents.forEach((o) => {
+      const t = o.team ?? 1;
+      teamCounts[t] = (teamCounts[t] ?? 0) + 1;
+    });
+  }
 
   return (
     // width:100% + alignItems:'stretch' matter here, not just centering:
@@ -462,23 +498,59 @@ export default function OnlineLobby({
                       <option value="versus">Versus</option>
                       <option value="practice">Practice</option>
                       <option value="coop">Co-op</option>
+                      <option value="teams">Teams</option>
+                      <option value="teams-coop">Teams Co-op</option>
                     </select>
                   ) : (
-                    <span style={{ color: 'white' }}>{roomSettings.gameMode === 'practice' ? 'Practice' : roomSettings.gameMode === 'coop' ? 'Co-op' : 'Versus'}</span>
+                    <span style={{ color: 'white' }}>
+                      {roomSettings.gameMode === 'practice' ? 'Practice'
+                        : roomSettings.gameMode === 'coop' ? 'Co-op'
+                        : roomSettings.gameMode === 'teams' ? 'Teams'
+                        : roomSettings.gameMode === 'teams-coop' ? 'Teams Co-op'
+                        : 'Versus'}
+                    </span>
                   )}
                 </div>
+                {/* Both team modes — how many teams the room splits into
+                    (2-4); each team's size is Room Size / Team Count.
+                    Placed right after Game Mode since it reframes what Room
+                    Size below means (a set of teams, not a flat player
+                    list) — same "settings that change meaning downstream go
+                    first" ordering Game Mode itself already established. */}
+                {isTeamsMode && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>Team Count</span>
+                    {isHost ? (
+                      <select value={roomSettings.teamCount} onChange={(e) => setTeamCount(Number(e.target.value))} style={SETTING_SELECT_STYLE}>
+                        {[2, 3, 4].map((n) => (
+                          <option key={n} value={n}>{n} teams</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span style={{ color: 'white' }}>{roomSettings.teamCount} teams</span>
+                    )}
+                  </div>
+                )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span>Room Size</span>
                   {/* Co-op's shared board only ever supports one partner
                       (see useOnlineRoom's setGameMode), so the size is
-                      fixed rather than editable while it's selected. */}
+                      fixed rather than editable while it's selected. Both
+                      team modes keep Room Size editable, but only offer
+                      sizes evenly divisible by Team Count (otherwise a team
+                      could end up an uneven size) — setTeamCount already
+                      re-derives maxPlayers to 2-per-team the moment Team
+                      Count changes, this just constrains what the host can
+                      pick afterward. */}
                   {roomSettings.gameMode === 'coop' ? (
                     <span style={{ color: 'white' }}>2 players (Co-op)</span>
                   ) : isHost ? (
                     <select value={roomSettings.maxPlayers} onChange={(e) => setMaxPlayers(Number(e.target.value))} style={SETTING_SELECT_STYLE}>
-                      {Array.from({ length: MAX_ROOM_SIZE - 1 }, (_, i) => i + 2).map((n) => (
-                        <option key={n} value={n}>{n} players</option>
-                      ))}
+                      {Array.from({ length: MAX_ROOM_SIZE - 1 }, (_, i) => i + 2)
+                        .filter((n) => !isTeamsMode || n % roomSettings.teamCount === 0)
+                        .map((n) => (
+                          <option key={n} value={n}>{n} players</option>
+                        ))}
                     </select>
                   ) : (
                     <span style={{ color: 'white' }}>{roomSettings.maxPlayers} players</span>
@@ -496,7 +568,7 @@ export default function OnlineLobby({
                     <span style={{ color: 'white' }}>{roomSettings.startingLevel}</span>
                   )}
                 </div>
-                {roomSettings.gameMode === 'versus' && (
+                {(roomSettings.gameMode === 'versus' || isTeamsMode) && (
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span>Lives</span>
                     {isHost ? (
@@ -545,6 +617,11 @@ export default function OnlineLobby({
                 open rather than just relabeling the button. */}
             {!startAt && (
               <>
+                {isTeamsMode && teamsConflict && (
+                  <div style={{ fontSize: '0.7rem', color: '#f87171', textAlign: 'center' }}>
+                    Everyone is on the same team — split up before you can start.
+                  </div>
+                )}
                 <button
                   style={selfReady ? SECONDARY_BUTTON_STYLE : PRIMARY_BUTTON_STYLE}
                   onClick={selfReady ? sendUnready : sendReady}
@@ -552,14 +629,32 @@ export default function OnlineLobby({
                   {selfReady ? 'Unready' : 'Ready'}
                 </button>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span>{nickname || 'You'}{isHost ? ' (Host)' : ''}</span>
-                    <span>{selfReady ? 'Ready' : 'Not ready'}</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      {isTeamsMode && (
+                        <select
+                          value={team}
+                          onChange={(e) => setTeam(Number(e.target.value))}
+                          style={{ ...SETTING_SELECT_STYLE, fontSize: '0.65rem', padding: '2px 4px' }}
+                        >
+                          {Array.from({ length: roomSettings.teamCount }, (_, i) => i + 1).map((n) => (
+                            <option key={n} value={n} disabled={n !== team && teamCounts[n] >= teamSize}>
+                              {TEAM_NAMES[n - 1] ?? `Team ${n}`}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {selfReady ? 'Ready' : 'Not ready'}
+                    </span>
                   </div>
                   {opponents.map((o) => (
                     <div key={o.guestId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <span>{o.nickname || o.guestId.slice(0, 4).toUpperCase()}{o.guestId === hostGuestId ? ' (Host)' : ''}</span>
                       <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        {isTeamsMode && (
+                          <span style={{ fontSize: '0.65rem', color: 'rgba(255,255,255,0.45)' }}>{TEAM_NAMES[(o.team ?? 1) - 1] ?? `Team ${o.team ?? 1}`}</span>
+                        )}
                         {readyGuestIds.has(o.guestId) ? 'Ready' : 'Not ready'}
                         {isHost && (
                           <button
